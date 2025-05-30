@@ -1,0 +1,169 @@
+# Configuration for Vision-Language-Action Model Training
+# Inspired by RoboVLMs configurations for PaliGemma.
+
+# --- Data Configuration ---
+data:
+  # Path to the directory containing training Parquet files, or a list of specific Parquet file paths.
+  # If a directory is provided, all .parquet files within that directory will be loaded.
+  train_parquet_files: "/root/private_data/dataset/xarm6_pick_oreo/training/" # Placeholder: e.g., "/path/to/calvin_dataset/train/"
+
+  # (Optional) Path to the directory containing validation Parquet files.
+  val_parquet_files: "/root/private_data/dataset/xarm6_pick_oreo/validation/"   # Placeholder: e.g., "/path/to/calvin_dataset/val/"
+
+  # Tokenizer: Should match the VLM backbone.
+  # For PaliGemma, this is usually the same as the model identifier.
+  tokenizer_name_or_path: "./weight/paligemma-3b-pt-224"
+
+  # Image Processor: Should match the VLM backbone.
+  image_processor_name_or_path: "./weight/paligemma-3b-pt-224"
+
+  # Max sequence length (window size) for model input.
+  # RoboVLMs uses window_size: 8 for some contexts.
+  max_seq_len: 8 
+
+  # Max length for tokenized prompts.
+  # RoboVLMs tokenizer.max_text_len: 256
+  prompt_max_len: 77 # Standard for many CLIP-based models, PaliGemma might allow longer. Check model specifics.
+                     # PaliGemma paper often mentions prompts like "detect <obj>", "segment <obj>", which are short.
+                     # Using 77 as a common default, can be increased if prompts are longer.
+
+  # Batch size for training and validation. Adjust based on GPU memory and model size.
+  # RoboVLMs example used batch_size: 1, likely due to model size or specific setup.
+  batch_size: 4 # Starting with a smaller batch size, adjust based on memory.
+
+  # Number of worker processes for DataLoader.
+  num_workers: 4 # RoboVLMs uses 8, adjust based on your system CPU and I/O.
+
+  # Action bounds for continuous action discretization.
+  # RoboVLMs act_head uses min_action: -1, max_action: 1.
+  action_bounds: [-1.0, 1.0]
+
+# --- Model Configuration ---
+model:
+  vlm_config:
+    # PaliGemma model from Hugging Face.
+    # RoboVLMs model_url points to "google/paligemma2-3b-pt-224". We use paligemma-3b-pt-224 as baseline.
+    # Ensure this model is accessible and downloaded if using local paths.
+    model_name_or_path: "./weight/paligemma-3b-pt-224" 
+
+    # Whether to use auxiliary camera input (image_2 from dataset).
+    # RoboVLMs use_hand_rgb: false
+    use_aux_camera: False 
+
+    # Freeze vision tower weights (image encoder).
+    # RoboVLMs train_setup.train_vision: true (means not frozen).
+    # RoboVLMs train_setup.freeze_backbone: false (implies vision tower also not frozen).
+    freeze_vision_tower: False
+
+    # Freeze language model weights.
+    # RoboVLMs train_setup.freeze_backbone: false.
+    freeze_language_model: False
+
+    # Data type for the VLM model. 
+    # RoboVLMs train_setup.precision: "bf16".
+    # "torch.float16" or "torch.bfloat16" for mixed-precision.
+    dtype: "torch.bfloat16" # Use "torch.float16" if bf16 not supported or causes issues.
+                            # Use "torch.float32" for CPU or if precision issues arise.
+  
+  # Configuration for the (conceptual) vision encoder modules within PaliGemmaVLM wrapper
+  # NOTE: For PaliGemma, the actual vision tower and projection are tightly integrated.
+  # These settings are for structural similarity and future extension possibilities.
+  # The PaliGemmaVLM currently uses the full PaliGemma model's internal vision processing.
+  vision_encoder_config: # New section
+    # Vision Tower settings (mostly conceptual for integrated PaliGemma)
+    vision_tower:
+      # model_name_or_path: "google/siglip-base-patch16-224" # Or path to a specific vision tower component if ever decoupled
+      # For PaliGemma, this is implicitly defined by vlm_config.model_name_or_path
+      pass # No specific configurable items for PaliGemma's integrated tower here yet.
+
+    # Vision Resampler settings
+    vision_resampler:
+      type: "mlp" # Changed from identity (or ensure it's mlp if it was missing)
+      # input_dim: Will be derived from vision tower output (e.g., PaliGemma vision tower feature dimension)
+      # output_dim: Should match PaliGemma's expected embedding dim for language model (e.g., lm_hidden_size)
+      # num_output_tokens: Number of visual tokens to feed to LM (e.g., PaliGemma's num_image_tokens)
+      # For MLP type, this is more of a conceptual target if not doing actual token reduction.
+      # Actual num_image_tokens for PaliGemma is fixed by its architecture.
+      mlp_projector:
+        # Example: if we were to have a simple MLP projector here.
+        # This is NOT directly used by the current PaliGemmaVLM to override its internal projector.
+        hidden_dim: null # Optional intermediate hidden dim for MLP projector
+        # output_dim will be lm_hidden_size of PaliGemma if this were to feed its LM
+
+  action_head_config:
+    # Whether to concatenate robot state vector with VLM embeddings.
+    use_state_input: True # Common in VLA models
+
+    # Number of dimensions in the action vector.
+    # RoboVLMs act_head.action_dim: 7.
+    num_action_dims: 7 
+
+    # Number of discrete bins per action dimension.
+    # RoboVLMs act_head.n_bin: 256.
+    num_action_bins: 256 
+
+    # MLP hidden layers for the action head.
+    # RoboVLMs act_head.hidden_size: 1024 (suggests a potentially large MLP).
+    # We can define a multi-layer MLP, e.g., [1024, 512] or a single layer [1024].
+    mlp_hidden_dims: [1024, 512] 
+
+    # Dropout probability for the action head MLP.
+    dropout_prob: 0.1
+
+# --- Training Configuration ---
+training:
+  # Number of training epochs.
+  # RoboVLMs trainer.max_epochs: 1 (often for fine-tuning specific datasets or quick runs).
+  epochs: 10 # Adjust for your dataset and convergence needs.
+
+  # Log training progress every N batches.
+  # RoboVLMs trainer.log_every_n_steps: 10.
+  log_interval: 10
+
+  # Root directory to save model checkpoints and logs.
+  checkpoint_dir: "./experiments" 
+
+  # Experiment name (subdirectory under checkpoint_dir).
+  experiment_name: "paligemma_vla_finetune" 
+
+  # Gradient clipping norm.
+  # RoboVLMs trainer.gradient_clip_val: 1.0.
+  grad_clip_norm: 1.0
+
+  # Random seed.
+  # RoboVLMs seed: 123.
+  seed: 123
+
+# --- Optimizer Configuration ---
+optimizer:
+  # Optimizer type.
+  # RoboVLMs optimizer: "adam" (AdamW is generally preferred for transformers).
+  type: "AdamW"
+
+  # Learning rate.
+  # RoboVLMs learning_rate: 2e-5.
+  lr: 2.0e-5
+
+  # Weight decay.
+  # RoboVLMs weight_decay: 0 (can be 0 or a small value like 0.01).
+  weight_decay: 0.01
+  
+  # AdamW specific betas (PyTorch defaults are [0.9, 0.999])
+  # betas: [0.9, 0.999]
+  # AdamW specific eps (PyTorch default is 1e-8)
+  # eps: 1.0e-8
+
+# --- Learning Rate Scheduler Configuration (Optional) ---
+# RoboVLMs uses a cosine scheduler with warmup (warmup_epochs: 0.25 or warmup_steps).
+# Our current setup uses standard PyTorch schedulers. For simple cosine annealing:
+lr_scheduler:
+  type: "CosineAnnealingLR" 
+  T_max: 10 # Corresponds to training.epochs for one cosine cycle if no warmup logic external to scheduler
+  eta_min: 2.0e-7 # (e.g., 0.01 * lr) RoboVLMs min_lr_scale: 1e-2 => 2e-5 * 1e-2 = 2e-7
+
+  # To implement warmup, one would typically modify the training loop or use a 
+  # more complex scheduler (e.g., from transformers.get_scheduler).
+  # For simplicity, this config assumes T_max is total epochs/steps if scheduler is called per epoch/step.
+  # If warmup_steps are used (like in RoboVLMs finetune_paligemma_vla.json warmup_steps: 100),
+  # T_max for CosineAnnealingLR would be total_steps - warmup_steps.
+  # Our current trainer calls scheduler.step() per epoch. So T_max = training.epochs is a common setup. 
