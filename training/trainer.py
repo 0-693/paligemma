@@ -10,6 +10,7 @@ from tqdm import tqdm
 import numpy as np
 import logging
 import torch.nn.functional as F
+import wandb
 
 # Assuming scripts like main_train.py are run from a context where 
 # 'model', 'utils', and 'data' are top-level directories/packages.
@@ -65,6 +66,7 @@ class VLATrainer:
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         self.logger.info(f"VLATrainer initialized. AMP scaler enabled: {self.scaler.is_enabled()}, use_bfloat16: {self.use_bfloat16}")
         self.best_val_loss = float('inf')
+        self.wandb_enabled = config.get('wandb_enabled', False)
 
     def _compute_loss(self, action_pred, action_labels, vlm_attention_mask):
         """
@@ -131,13 +133,30 @@ class VLATrainer:
                 self.optimizer.step()
 
             total_loss += loss.item()
-            progress_bar.set_postfix(loss=loss.item(), avg_loss=total_loss / (batch_idx + 1), lr=self.optimizer.param_groups[0]['lr'])
+            current_lr = self.optimizer.param_groups[0]['lr']
+            progress_bar.set_postfix(loss=loss.item(), avg_loss=total_loss / (batch_idx + 1), lr=current_lr)
+
+            # Log to wandb (per batch/step)
+            if self.wandb_enabled and (batch_idx + 1) % self.log_interval == 0:
+                wandb.log({
+                    "train/batch_loss": loss.item(),
+                    "train/avg_loss_so_far": total_loss / (batch_idx + 1),
+                    "train/learning_rate": current_lr,
+                    "train/epoch": epoch_num + 1,
+                    "train/step": epoch_num * len(self.train_dataloader) + batch_idx 
+                })
 
             if (batch_idx + 1) % self.log_interval == 0:
                 avg_loss_so_far = total_loss / (batch_idx + 1)
-                self.logger.info(f"Epoch {epoch_num + 1}/{self.epochs}, Batch {batch_idx + 1}/{len(self.train_dataloader)}, Train Loss: {loss.item():.4f}, Avg Train Loss: {avg_loss_so_far:.4f}, LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+                self.logger.info(f"Epoch {epoch_num + 1}/{self.epochs}, Batch {batch_idx + 1}/{len(self.train_dataloader)}, Train Loss: {loss.item():.4f}, Avg Train Loss: {avg_loss_so_far:.4f}, LR: {current_lr:.2e}")
         avg_epoch_loss = total_loss / len(self.train_dataloader)
         self.logger.info(f"Epoch {epoch_num + 1} Training Summary: Average Loss: {avg_epoch_loss:.4f}")
+        # Log to wandb (per epoch)
+        if self.wandb_enabled:
+            wandb.log({
+                "train/epoch_loss": avg_epoch_loss,
+                "train/epoch": epoch_num + 1
+            })
         return avg_epoch_loss
 
     def validate_one_epoch(self, epoch_num):
@@ -178,10 +197,19 @@ class VLATrainer:
                 progress_bar.set_postfix(loss=loss.item(), avg_loss=total_val_loss / (batch_idx + 1))
         avg_val_loss = total_val_loss / len(self.val_dataloader) if len(self.val_dataloader) > 0 else float('inf')
         self.logger.info(f"Epoch {epoch_num + 1} Validation Summary: Average Loss: {avg_val_loss:.4f}")
+        # Log to wandb (per epoch)
+        if self.wandb_enabled and self.val_dataloader is not None: # 确保有验证数据
+            wandb.log({
+                "val/epoch_loss": avg_val_loss,
+                "val/epoch": epoch_num + 1
+            })
         return avg_val_loss
 
     def train(self, start_epoch=0):
         self.logger.info(f"Starting training loop from epoch {start_epoch + 1} to {self.epochs}.")
+        if self.wandb_enabled and hasattr(wandb, 'watch'): # 监视模型梯度和参数（可选）
+            wandb.watch(self.model, log="all", log_freq=self.log_interval * 10, log_graph=False) # 每 N 个 batch 记录一次
+
         for epoch in range(start_epoch, self.epochs):
             self.logger.info(f"--- Epoch {epoch + 1}/{self.epochs} ---")
             train_loss = self.train_one_epoch(epoch)
@@ -201,13 +229,19 @@ class VLATrainer:
 
             # Save checkpoint
             checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pth")
-            save_checkpoint(epoch + 1, self.model, self.optimizer, self.lr_scheduler, checkpoint_path, self.logger)
+            state = {
+                'epoch': epoch + 1,
+                'state_dict': self.model.state_dict(),
+                'optimizer': self.optimizer.state_dict(),
+                'lr_scheduler': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
+            }
+            save_checkpoint(state, is_best=False, filename=checkpoint_path)
 
             # Save best model based on validation loss
             if val_loss is not None and val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 best_checkpoint_path = os.path.join(self.checkpoint_dir, "checkpoint_best_val.pth")
-                save_checkpoint(epoch + 1, self.model, self.optimizer, self.lr_scheduler, best_checkpoint_path, self.logger, is_best=True)
+                save_checkpoint(state, is_best=True, filename=best_checkpoint_path)
                 self.logger.info(f"Saved new best validation model (Epoch {epoch + 1}, Val Loss: {val_loss:.4f}) to {best_checkpoint_path}")
             elif val_loss is None and self.val_dataloader is None: # If no validation, save based on train loss (e.g. save every N epochs or last one)
                  # For now, just saving epoch checkpoint is enough. Could add logic to save based on train_loss if desired.

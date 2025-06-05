@@ -19,7 +19,7 @@ data:
 
   # Max sequence length (window size) for model input.
   # RoboVLMs uses window_size: 8 for some contexts.
-  max_seq_len: 8 
+  max_seq_len: 4 
 
   # Max length for tokenized prompts.
   # RoboVLMs tokenizer.max_text_len: 256
@@ -29,7 +29,7 @@ data:
 
   # Batch size for training and validation. Adjust based on GPU memory and model size.
   # RoboVLMs example used batch_size: 1, likely due to model size or specific setup.
-  batch_size: 4 # Starting with a smaller batch size, adjust based on memory.
+  batch_size: 5 # Starting with a smaller batch size, adjust based on memory.
 
   # Number of worker processes for DataLoader.
   num_workers: 4 # RoboVLMs uses 8, adjust based on your system CPU and I/O.
@@ -37,6 +37,8 @@ data:
   # Action bounds for continuous action discretization.
   # RoboVLMs act_head uses min_action: -1, max_action: 1.
   action_bounds: [-1.0, 1.0]
+
+  normalization_stats_path: "normalization_stats.json"
 
 # --- Model Configuration ---
 model:

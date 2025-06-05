@@ -7,11 +7,13 @@ import torch
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import json # For loading stats 
 
 from data.loader import VLADataset, vla_collate_fn # For loading evaluation datasets
 from torch.utils.data import DataLoader
 from inference.predictor import VLAPredictor
-from utils.misc import setup_logging, discretize_actions, undiscretize_actions
+from utils.misc import setup_logging, discretize_actions, undiscretize_actions, denormalize # Added denormalize
+from utils.config_utils import OmegaConfAttrDict # For config loading
 
 def calculate_metrics(all_pred_bins, all_true_bins, all_pred_continuous, all_true_continuous, vlm_masks, num_action_dims):
     """
@@ -97,11 +99,11 @@ def calculate_metrics(all_pred_bins, all_true_bins, all_pred_continuous, all_tru
 
 def main(args):
     # --- Setup Logger ---
-    output_dir = args.output_dir if args.output_dir else 
+    output_dir = args.output_dir if args.output_dir else \
                  os.path.join(os.path.dirname(args.checkpoint_path), 'eval_results')
     os.makedirs(output_dir, exist_ok=True)
     log_file = os.path.join(output_dir, 'evaluation.log')
-    global logger # Make logger global for access in calculate_metrics if called from elsewhere
+    global logger 
     logger = setup_logging(log_file=log_file, name="VLAEvaluator")
     logger.info(f"Evaluation results will be saved in: {output_dir}")
 
@@ -113,12 +115,27 @@ def main(args):
         logger.error(f"Error initializing VLAPredictor: {e}", exc_info=True)
         return
 
+    # --- Load Normalization Stats for Denormalization ---
+    action_norm_stats = None
+    if predictor.norm_stats and 'action' in predictor.norm_stats:
+        action_norm_stats = predictor.norm_stats['action']
+        logger.info("Using action normalization stats from predictor for denormalization.")
+        # Ensure min/max are torch tensors on CPU for upcoming operations if they aren't already
+        if isinstance(action_norm_stats['min'], list):
+            action_norm_stats['min'] = torch.tensor(action_norm_stats['min'], dtype=torch.float32)
+        if isinstance(action_norm_stats['max'], list):
+            action_norm_stats['max'] = torch.tensor(action_norm_stats['max'], dtype=torch.float32)
+        action_norm_stats['min'] = action_norm_stats['min'].cpu()
+        action_norm_stats['max'] = action_norm_stats['max'].cpu()
+    else:
+        logger.warning("Action normalization stats not found in predictor. Predictions might not be denormalized correctly.")
+
     all_pred_action_bins = []
-    all_true_action_bins = [] # Only if evaluating a dataset with labels
-    all_pred_actions_continuous = []
-    all_true_actions_continuous = [] # Only if evaluating a dataset with labels
+    all_true_action_bins = [] 
+    all_pred_actions_continuous_denorm = [] # Store denormalized predictions
+    all_true_actions_continuous_gt_norm = [] # Store normalized ground truth from dataset
     all_vlm_masks = []
-    all_prompts = [] # To store prompts for context if saving results
+    all_prompts = [] 
     # --- Process Data and Predict ---
     if args.eval_data_path: # Batch evaluation from dataset files
         logger.info(f"Evaluating dataset from: {args.eval_data_path}")
@@ -151,69 +168,149 @@ def main(args):
         logger.info(f"Evaluation dataset size: {len(eval_dataset)}. Batch size: {args.batch_size}")
         progress_bar = tqdm(eval_loader, desc="Evaluating Batches")
         for batch_data in progress_bar:
-            # Move data to predictor's device (predictor.predict expects data on its device)
-            # VLAPredictor._preprocess_single_item does this, but for batch, we do it here
             processed_batch = {}
-            for key, tensor in batch_data.items():
-                if isinstance(tensor, torch.Tensor):
-                    processed_batch[key] = tensor.to(predictor.device, 
-                                                     dtype=predictor.model_dtype if tensor.is_floating_point() else tensor.dtype)
+            for key, value in batch_data.items():
+                if isinstance(value, torch.Tensor):
+                    processed_batch[key] = value.to(predictor.device, dtype=predictor.model_dtype if value.is_floating_point() else value.dtype)
                 else:
-                    processed_batch[key] = tensor # For non-tensor data like sequence_length list
+                    processed_batch[key] = value 
             
-            predictions = predictor.predict(processed_batch)
-            all_pred_action_bins.append(predictions['predicted_action_bins'].cpu())
-            all_pred_actions_continuous.append(predictions['predicted_actions_continuous'].cpu())
+            predictions_dict = predictor.predict(processed_batch) # Returns dict with normalized continuous actions
+            pred_actions_continuous_normalized = predictions_dict['predicted_actions_continuous'].cpu()
+            
+            # Denormalize continuous predictions
+            pred_actions_denormalized = pred_actions_continuous_normalized # Default to normalized if no stats
+            if action_norm_stats and action_norm_stats['min'] is not None and action_norm_stats['max'] is not None:
+                # Ensure stats are tensors on the same device as the data for denormalize function
+                action_min = action_norm_stats['min'].to(pred_actions_continuous_normalized.device)
+                action_max = action_norm_stats['max'] .to(pred_actions_continuous_normalized.device)
+                pred_actions_denormalized = denormalize(pred_actions_continuous_normalized, action_min, action_max)
+            else:
+                logger.warning("Predictor action norm_stats not available for denormalization. Using normalized predictions as denormalized.")
+            
+            all_pred_actions_continuous_denorm.append(pred_actions_denormalized)
             all_vlm_masks.append(processed_batch['vlm_attention_mask'].cpu())
-            all_prompts.extend([eval_dataset.tokenizer.decode(ids, skip_special_tokens=True) for ids in processed_batch['prompt_input_ids']])
+            
+            if 'raw_prompt_text' in processed_batch:
+                all_prompts.extend(processed_batch['raw_prompt_text'])
+            elif 'prompt_input_ids' in processed_batch: 
+                all_prompts.extend([predictor.tokenizer.decode(ids.cpu(), skip_special_tokens=True) for ids in processed_batch['prompt_input_ids']])
 
-            if 'action' in processed_batch: # True actions available for metrics
-                true_actions_continuous = processed_batch['action'] # Already on device
-                true_action_bins = discretize_actions(
-                    true_actions_continuous, 
-                    predictor.num_action_bins, 
-                    predictor.action_bounds
+            if 'action' in processed_batch: 
+                true_actions_continuous_normalized_gt = processed_batch['action'].cpu() # These are from VLADataset, already normalized
+                all_true_actions_continuous_gt_norm.append(true_actions_continuous_normalized_gt)
+
+                # --- Binning for metrics: Use denormalized predictions and denormalized GT ---
+                # Denormalize GT actions for consistent binning if stats are available
+                true_actions_denormalized_gt = true_actions_continuous_normalized_gt # Default
+                if action_norm_stats and action_norm_stats['min'] is not None and action_norm_stats['max'] is not None:
+                    gt_action_min = action_norm_stats['min'].to(true_actions_continuous_normalized_gt.device)
+                    gt_action_max = action_norm_stats['max'].to(true_actions_continuous_normalized_gt.device)
+                    true_actions_denormalized_gt = denormalize(true_actions_continuous_normalized_gt, gt_action_min, gt_action_max)
+                else:
+                    logger.warning("Cannot denormalize GT actions for binning. Binning GT on normalized scale.")
+
+                pred_bins = discretize_actions(
+                    pred_actions_denormalized, # Use denormalized predictions
+                    predictor.config.model.action_head_config.num_action_bins, 
+                    predictor.config.model.action_head_config.get('action_bounds', (-1.0, 1.0)) # Assumed to be for original scale
                 ).cpu()
-                all_true_action_bins.append(true_action_bins)
-                all_true_actions_continuous.append(true_actions_continuous.cpu())
+                all_pred_action_bins.append(pred_bins)
+                
+                true_bins = discretize_actions(
+                    true_actions_denormalized_gt, # Use denormalized GT for binning
+                    predictor.config.model.action_head_config.num_action_bins, 
+                    predictor.config.model.action_head_config.get('action_bounds', (-1.0, 1.0))
+                ).cpu()
+                all_true_action_bins.append(true_bins)
 
     elif args.image1_paths and args.prompt: # Single item inference
         logger.info("Performing single item inference.")
-        if not isinstance(args.image1_paths, list):
-            args.image1_paths = [args.image1_paths]
-        if args.image2_paths and not isinstance(args.image2_paths, list):
-            args.image2_paths = [args.image2_paths]
+        img1_paths_list = args.image1_paths
+        if isinstance(args.image1_paths, str):
+            img1_paths_list = args.image1_paths.split(',')
+
+        img2_paths_list = None
+        if args.image2_paths:
+            img2_paths_list = args.image2_paths
+            if isinstance(args.image2_paths, str):
+                img2_paths_list = args.image2_paths.split(',')
+
+        state_vec_orig = np.array(args.state_vector, dtype=np.float32) if args.state_vector and args.state_vector != 'None' else None
+        if state_vec_orig is not None and state_vec_orig.ndim == 0 : state_vec_orig = None
         
-        state_vec = np.array(args.state_vector, dtype=np.float32) if args.state_vector else None
-        if state_vec is not None and state_vec.ndim == 0 : state_vec = None # Handle case where it might be passed as empty string then None
+        state_vec_normalized = state_vec_orig
+        if state_vec_orig is not None and predictor.norm_stats and 'state' in predictor.norm_stats and \
+           predictor.norm_stats['state']['min'] is not None and predictor.norm_stats['state']['max'] is not None:
+            state_min_tensor = predictor.norm_stats['state']['min']
+            state_max_tensor = predictor.norm_stats['state']['max']
+            # Ensure tensors are on CPU for numpy conversion if they are not already
+            state_min_np = state_min_tensor.cpu().numpy() if isinstance(state_min_tensor, torch.Tensor) else np.array(state_min_tensor)
+            state_max_np = state_max_tensor.cpu().numpy() if isinstance(state_max_tensor, torch.Tensor) else np.array(state_max_tensor)
+            
+            # Apply normalization: x_norm = 2 * (x - min) / (max - min) - 1
+            state_vec_normalized = 2 * (state_vec_orig - state_min_np) / (state_max_np - state_min_np + 1e-8) - 1
+            logger.info("Single item state vector normalized.")
+        elif state_vec_orig is not None:
+            logger.warning("Normalization stats for state not available. Using original state vector for single item inference.")
 
         preprocessed_input = predictor._preprocess_single_item(
-            image_1_paths=args.image1_paths,
+            image_1_paths=img1_paths_list,
             prompt_text=args.prompt,
-            image_2_paths=args.image2_paths,
-            state_vector=state_vec,
-            max_seq_len=args.max_seq_len_override or len(args.image1_paths), # Use actual length or override
+            image_2_paths=img2_paths_list,
+            state_vector=state_vec_normalized, # Pass the (potentially) normalized state
+            max_seq_len=args.max_seq_len_override or len(img1_paths_list),
             prompt_max_len=args.prompt_max_len_override or 128
         )
-        predictions = predictor.predict(preprocessed_input)
-        all_pred_action_bins.append(predictions['predicted_action_bins'].cpu())
-        all_pred_actions_continuous.append(predictions['predicted_actions_continuous'].cpu())
-        all_vlm_masks.append(preprocessed_input['vlm_attention_mask'].cpu()) # Mask for this single item
+        predictions_dict = predictor.predict(preprocessed_input)
+        pred_actions_continuous_normalized = predictions_dict['predicted_actions_continuous'].cpu()
+
+        pred_actions_denormalized = pred_actions_continuous_normalized # Default
+        if action_norm_stats and action_norm_stats['min'] is not None and action_norm_stats['max'] is not None:
+            action_min = action_norm_stats['min'].to(pred_actions_continuous_normalized.device)
+            action_max = action_norm_stats['max'].to(pred_actions_continuous_normalized.device)
+            pred_actions_denormalized = denormalize(pred_actions_continuous_normalized, action_min, action_max)
+            logger.info("Single item predicted action denormalized.")
+        else:
+            logger.warning("Action norm stats not found. Using normalized action as denormalized for single item.")
+        
+        all_pred_actions_continuous_denorm.append(pred_actions_denormalized)
+        all_vlm_masks.append(preprocessed_input['vlm_attention_mask'].cpu()) 
         all_prompts.append(args.prompt)
-        # No true actions for single inference unless passed via args (not implemented here for simplicity)
 
     else:
         logger.error("No evaluation data provided. Please specify --eval_data_path or individual input args (--image1_paths, --prompt).")
         return
 
     # --- Calculate and Log Metrics (if true labels were available) ---
-    if all_true_action_bins:
+    if all_true_actions_continuous_gt_norm: # Check if we have GT actions (these are normalized from VLADataset)
         logger.info("Calculating metrics...")
-        num_action_dims = predictor.config['action_head_config']['num_action_dims']
+        num_action_dims = predictor.config.model.action_head_config.num_action_dims
+        
+        # Denormalize ground truth actions for consistent metric calculation
+        all_true_actions_continuous_denorm_gt = []
+        if action_norm_stats and action_norm_stats['min'] is not None and action_norm_stats['max'] is not None:
+            gt_action_min = action_norm_stats['min'] # Already .cpu() from earlier
+            gt_action_max = action_norm_stats['max'] # Already .cpu() from earlier
+            for true_actions_norm_batch in all_true_actions_continuous_gt_norm:
+                # Ensure data is on the same device as stats if denormalize expects it (or handle inside denormalize)
+                # Our denormalize converts stats to tensor on data's device.
+                all_true_actions_continuous_denorm_gt.append(denormalize(true_actions_norm_batch.cpu(), gt_action_min, gt_action_max))
+            logger.info("Ground truth actions denormalized for metrics.")
+        else:
+            logger.warning("Cannot denormalize ground truth actions for metrics due to missing stats. MSE/MAE might be on normalized scale if calculated using normalized GT.")
+            all_true_actions_continuous_denorm_gt = all_true_actions_continuous_gt_norm # Fallback to normalized GT
+
+        # At this point, all_pred_actions_continuous_denorm and all_true_actions_continuous_denorm_gt are in original scale.
+        # Binned actions (all_pred_action_bins, all_true_action_bins) were also created based on denormalized values and original scale bounds.
+
         metrics = calculate_metrics(
-            all_pred_action_bins, all_true_action_bins,
-            all_pred_actions_continuous, all_true_actions_continuous,
-            all_vlm_masks, num_action_dims
+            all_pred_action_bins,               # Bins from denormalized preds, original scale bounds
+            all_true_action_bins,               # Bins from denormalized GT, original scale bounds
+            all_pred_actions_continuous_denorm, # Continuous denormalized preds
+            all_true_actions_continuous_denorm_gt, # Continuous denormalized GT
+            all_vlm_masks, 
+            num_action_dims
         )
         logger.info("Evaluation Metrics:")
         for key, value in metrics.items():
@@ -229,29 +326,47 @@ def main(args):
     # --- Save Predictions (Optional) ---
     if args.save_predictions:
         logger.info("Saving predictions...")
-        # Flatten predictions and prepare for DataFrame
-        # This part can be elaborated to save more context (e.g., prompt, image_ids if available)
         flat_predictions = []
-        step_counter = 0
-        for i in range(len(all_pred_actions_continuous)):
-            batch_preds_cont = all_pred_actions_continuous[i] # (B, S, D)
-            batch_preds_bins = all_pred_action_bins[i]       # (B, S, D)
-            batch_mask = all_vlm_masks[i]                    # (B, S)
-            
-            for b_idx in range(batch_preds_cont.shape[0]): # Iterate through batch
-                prompt_for_batch_item = all_prompts[step_counter // batch_preds_cont.shape[1]] if all_prompts else "N/A"
-                step_counter += batch_preds_cont.shape[1] # Assuming all_prompts length matches number of items
+        num_items_processed = 0 # For aligning prompts with batch items
 
-                for s_idx in range(batch_preds_cont.shape[1]): # Iterate through sequence
-                    if batch_mask[b_idx, s_idx].item(): # Only save valid steps
-                        record = {'prompt': prompt_for_batch_item, 'sequence_step': s_idx}
-                        for d_idx in range(batch_preds_cont.shape[2]): # Iterate through action dimensions
-                            record[f'pred_cont_dim_{d_idx}'] = batch_preds_cont[b_idx, s_idx, d_idx].item()
-                            record[f'pred_bin_dim_{d_idx}'] = batch_preds_bins[b_idx, s_idx, d_idx].item()
-                            if all_true_actions_continuous and i < len(all_true_actions_continuous) and b_idx < all_true_actions_continuous[i].shape[0] and s_idx < all_true_actions_continuous[i].shape[1] and d_idx < all_true_actions_continuous[i].shape[2]:
-                                record[f'true_cont_dim_{d_idx}'] = all_true_actions_continuous[i][b_idx, s_idx, d_idx].item()
-                                record[f'true_bin_dim_{d_idx}'] = all_true_action_bins[i][b_idx, s_idx, d_idx].item()
+        # Ensure all lists for metrics have the same number of batches
+        num_batches = len(all_pred_actions_continuous_denorm)
+
+        for i in range(num_batches):
+            batch_preds_cont_denorm = all_pred_actions_continuous_denorm[i] 
+            batch_preds_bins = all_pred_action_bins[i] if i < len(all_pred_action_bins) else None                   
+            batch_mask = all_vlm_masks[i]                                 
+            
+            # Ground truth for saving (optional)
+            batch_true_cont_denorm = all_true_actions_continuous_denorm_gt[i] if all_true_actions_continuous_denorm_gt and i < len(all_true_actions_continuous_denorm_gt) else None
+            batch_true_bins = all_true_action_bins[i] if all_true_action_bins and i < len(all_true_action_bins) else None
+            
+            current_batch_size = batch_preds_cont_denorm.shape[0]
+
+            for b_idx in range(current_batch_size): 
+                prompt_for_item = "N/A"
+                item_abs_idx = num_items_processed + b_idx
+                if all_prompts and item_abs_idx < len(all_prompts):
+                    prompt_for_item = all_prompts[item_abs_idx]
+                
+                for s_idx in range(batch_preds_cont_denorm.shape[1]): 
+                    if batch_mask[b_idx, s_idx].item(): 
+                        record = {
+                            'item_index_in_dataset': item_abs_idx, 
+                            'sequence_step': s_idx,
+                            'prompt': prompt_for_item
+                        }
+                        for d_idx in range(batch_preds_cont_denorm.shape[2]): 
+                            record[f'pred_cont_dim_{d_idx}'] = batch_preds_cont_denorm[b_idx, s_idx, d_idx].item()
+                            if batch_preds_bins is not None:
+                                record[f'pred_bin_dim_{d_idx}'] = batch_preds_bins[b_idx, s_idx, d_idx].item()
+                            
+                            if batch_true_cont_denorm is not None and s_idx < batch_true_cont_denorm.shape[1] and d_idx < batch_true_cont_denorm.shape[2]:
+                                record[f'true_cont_dim_{d_idx}'] = batch_true_cont_denorm[b_idx, s_idx, d_idx].item()
+                            if batch_true_bins is not None and s_idx < batch_true_bins.shape[1] and d_idx < batch_true_bins.shape[2]:
+                                record[f'true_bin_dim_{d_idx}'] = batch_true_bins[b_idx, s_idx, d_idx].item()
                         flat_predictions.append(record)
+            num_items_processed += current_batch_size
         
         pred_df = pd.DataFrame(flat_predictions)
         predictions_path = os.path.join(output_dir, 'predictions.csv')

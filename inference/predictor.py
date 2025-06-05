@@ -3,10 +3,11 @@
 import torch
 import yaml
 import os
+import json
 
 # Assuming scripts are run from a context where 'model', 'utils', 'data' are top-level.
 from model.vla_model import VLAModel
-from utils.misc import load_checkpoint, undiscretize_actions, setup_logging
+from utils.misc import load_checkpoint, undiscretize_actions, setup_logging, denormalize
 from data.loader import VLAImageProcessor, DEFAULT_IMAGE_SIZE # For standalone image processing if needed
 from transformers import AutoTokenizer # For standalone text processing if needed
 from PIL import Image
@@ -34,14 +35,64 @@ class VLAPredictor:
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
         self.logger.info(f"Loading checkpoint from '{checkpoint_path}'")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu') # Load to CPU first
+        checkpoint = torch.load(checkpoint_path, map_location='cpu') 
         
         self.config = checkpoint.get('config')
         if not self.config:
-            raise ValueError("Config not found in checkpoint. Cannot initialize model.")
+            # Try to load from old checkpoint format if config is not at top level
+            if checkpoint.get('model_config') and checkpoint.get('train_config'):
+                self.logger.warning("Loading config from older checkpoint format.")
+                self.config = {
+                    'model': checkpoint['model_config'],
+                    'training': checkpoint['train_config'],
+                    'data': checkpoint.get('data_config', {}), # Add data_config if present
+                    'optimizer': checkpoint.get('optimizer_config', {}), # Add optimizer_config if present
+                    'lr_scheduler': checkpoint.get('lr_scheduler_config', {})
+                }
+                # Convert to OmegaConfAttrDict if you were using it, otherwise basic dict is fine for access.
+                from utils.config_utils import OmegaConfAttrDict
+                self.config = OmegaConfAttrDict(self.config)
+            else:
+                raise ValueError("Config not found in checkpoint. Cannot initialize model.")
+
+        # Load normalization stats if path is in config
+        self.norm_stats = None
+        self.normalization_stats_path = self.config.data.get('normalization_stats_path', None)
+        if self.normalization_stats_path and os.path.isabs(self.normalization_stats_path):
+            # If absolute path is stored, use it directly
+            pass
+        elif self.normalization_stats_path:
+            # If relative, assume it's relative to the checkpoint's directory or a known root
+            # For simplicity, let's try relative to checkpoint dir first
+            potential_path = os.path.join(os.path.dirname(checkpoint_path), self.normalization_stats_path)
+            if os.path.exists(potential_path):
+                self.normalization_stats_path = potential_path
+            else:
+                # Fallback: assume it might be relative to CWD or a predefined project root if needed
+                # For now, if not found relative to checkpoint, it might fail later or use None.
+                self.logger.warning(f"Normalization stats path \"{self.normalization_stats_path}\" from config is relative. Tried relative to checkpoint, but {potential_path} not found. Ensure path is correct or absolute.")
+
+        if self.normalization_stats_path and os.path.exists(self.normalization_stats_path):
+            try:
+                with open(self.normalization_stats_path, 'r') as f:
+                    self.norm_stats = json.load(f)
+                self.logger.info(f"Successfully loaded normalization stats from {self.normalization_stats_path}")
+                if self.norm_stats:
+                    for key in ['state', 'action']:
+                        if key in self.norm_stats:
+                            for stat_type in ['min', 'max']:
+                                if stat_type in self.norm_stats[key]:
+                                    self.norm_stats[key][stat_type] = torch.tensor(self.norm_stats[key][stat_type], dtype=self.model_dtype) # Use model_dtype
+            except Exception as e:
+                self.logger.error(f"Error loading or parsing normalization stats from {self.normalization_stats_path}: {e}. Proceeding without denormalization capabilities for direct calls.")
+                self.norm_stats = None
+        elif self.normalization_stats_path:
+            self.logger.warning(f"Normalization stats file not found at resolved path: {self.normalization_stats_path}. Proceeding without denormalization capabilities for direct calls.")
+        else:
+            self.logger.info("No normalization_stats_path found in config. Denormalization will not be available internally.")
 
         # Determine model dtype from config or default to float32 for CPU / float16 for CUDA
-        model_dtype_str = self.config.get('vlm_config', {}).get('dtype', None) # Assuming dtype was stored in vlm_config
+        model_dtype_str = self.config.model.vlm_config.get('dtype', None) # Assuming dtype was stored in vlm_config
         if model_dtype_str == 'torch.float16':
             self.model_dtype = torch.float16
         elif model_dtype_str == 'torch.float32':
@@ -165,25 +216,55 @@ class VLAPredictor:
     def predict(self, batch):
         self.model.eval()
         with torch.no_grad():
-            image_1_batch = batch['image_1'].to(self.device)
+            image_1_batch = batch['image_1'].to(self.device, dtype=self.model_dtype)
             raw_prompt_texts_batch = batch['raw_prompt_text']
             vlm_attention_mask = batch['vlm_attention_mask'].to(self.device)
             state_batch = batch.get('state', None)
             if state_batch is not None:
-                state_batch = state_batch.to(self.device)
+                state_batch = state_batch.to(self.device, dtype=self.model_dtype) # state is now normalized, should match model_dtype
             image_2_batch = batch.get('image_2', None)
             if image_2_batch is not None:
-                image_2_batch = image_2_batch.to(self.device)
+                image_2_batch = image_2_batch.to(self.device, dtype=self.model_dtype)
 
-            action_pred = self.model(
+            # Model outputs normalized actions if training was done with normalized actions
+            action_pred_normalized = self.model(
                 image_1_batch=image_1_batch,
                 raw_prompt_texts_batch=raw_prompt_texts_batch,
                 vlm_attention_mask_batch=vlm_attention_mask,
-                state_batch=state_batch,
+                state_batch=state_batch, # This is the normalized state from DataLoader
                 image_2_batch=image_2_batch
             )
-            # 直接输出连续动作
-            return action_pred
+            
+            # The VLAPredictor itself will return the normalized prediction.
+            # Denormalization should happen in the script that calls the predictor and uses the action.
+            # This keeps VLAPredictor focused on prediction and VLAModel on its core logic.
+            
+            # For compatibility with existing main_eval.py that might expect discretized actions:
+            # If action_pred_normalized is (B, S, D_action_continuous)
+            # And original code expects bins, we might need to handle that.            
+            # Current VLAModel directly outputs continuous actions (or velocities if flow matching).
+            # The `discretize_actions` utility is separate.
+
+            # For now, assume `action_pred_normalized` is the continuous output.
+            # The `main_eval.py` script will be responsible for denormalizing it if needed.
+            # It might also discretize the original or denormalized version for some metrics.
+
+            # Prepare a dictionary similar to what main_eval.py might expect
+            # This part needs to align with how VLAModel output is structured and how main_eval consumes it.
+            # Assuming VLAModel.forward returns a tensor of shape (B, S, D_action_continuous)
+            
+            # Let's rename for clarity, this is still normalized.
+            predicted_actions_continuous_normalized = action_pred_normalized
+
+            # If main_eval.py needs binned actions, it should create them from the continuous ones.
+            # We can provide a placeholder or calculate if really needed here.
+            # For now, let main_eval handle discretization from continuous.
+            predicted_action_bins_placeholder = torch.zeros_like(predicted_actions_continuous_normalized, dtype=torch.long)
+
+            return {
+                "predicted_actions_continuous": predicted_actions_continuous_normalized, # This is normalized
+                "predicted_action_bins": predicted_action_bins_placeholder # Placeholder, main_eval to generate if needed
+            }
 
 # Example Usage (Conceptual)
 if __name__ == '__main__':
@@ -248,8 +329,8 @@ if __name__ == '__main__':
         # Perform prediction
         prediction_output = predictor.predict(single_item_preprocessed)
         logger.info(f"Prediction successful.")
-        logger.info(f"Predicted action logits shape: {prediction_output.shape}")
-        logger.info(f"Sample continuous action: {prediction_output[0,0,:]}") # B=0, S=0
+        logger.info(f"Predicted action logits shape: {prediction_output['predicted_actions_continuous'].shape}")
+        logger.info(f"Sample continuous action: {prediction_output['predicted_actions_continuous'][0,0,:]}") # B=0, S=0
 
     except Exception as e:
         logger.error(f"Error in VLAPredictor conceptual test: {e}", exc_info=True)

@@ -9,6 +9,7 @@ import random
 import numpy as np
 from datetime import datetime
 import logging
+import wandb
 
 from data.loader import VLADataset, vla_collate_fn
 from torch.utils.data import DataLoader
@@ -70,6 +71,30 @@ def main(args):
     logger.info(f"Main logger configured. Log file: {log_file}")
     # Pass this main logger to sub-modules for consistent logging
 
+    # --- WandB Initialization ---
+    if args.use_wandb:
+        try:
+            run_id = wandb.util.generate_id()
+            if args.resume_checkpoint and wandb.run is not None and wandb.run.resumed:
+                run_id = wandb.run.id
+            
+            wandb.init(
+                project=args.wandb_project_name or f"VLA_Project_{config.training.experiment_name}",
+                entity=args.wandb_entity,
+                name=f"{config.training.experiment_name}_{current_time}",
+                config=config_dict,
+                resume="allow",
+                id=run_id,
+                mode="offline" 
+            )
+            logger.info(f"Weights & Biases initialized. Run name: {wandb.run.name}, Run ID: {wandb.run.id}")
+            config.wandb_enabled = True 
+        except Exception as e:
+            logger.error(f"Failed to initialize Weights & Biases: {e}. Proceeding without wandb.")
+            config.wandb_enabled = False
+    else:
+        config.wandb_enabled = False
+
     # Set device (GPU if available, else CPU)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -95,6 +120,7 @@ def main(args):
         "logger": logger,
         "use_siglip": True,
         "siglip_model_name": getattr(config.data, 'siglip_model_name', 'google/siglip-base-patch16-224'),
+        "normalization_stats_path": config.data.get('normalization_stats_path', None)
     }
 
     train_dataset = VLADataset(
@@ -203,6 +229,10 @@ def main(args):
         }
         save_checkpoint(state, is_best=False, filename=crash_checkpoint_path)
         logger.info(f"Saved crash checkpoint to {crash_checkpoint_path}")
+    finally:
+        if config.wandb_enabled and wandb.run:
+            wandb.finish()
+            logger.info("Weights & Biases run finished.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train VLA Model")
@@ -217,6 +247,9 @@ if __name__ == "__main__":
     parser.add_argument("--model_path_override", type=str, help="Override VLM model name or path (e.g., for PaliGemma).")
     parser.add_argument("--train_data_override", type=str, help="Comma-separated list of train Parquet files/dirs to override config.")
     parser.add_argument("--val_data_override", type=str, help="Comma-separated list of val Parquet files/dirs to override config.")
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb_project_name", type=str, default=None, help="Weights & Biases project name.")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Weights & Biases entity (team name).")
 
     args = parser.parse_args()
     

@@ -9,6 +9,8 @@ import numpy as np
 from transformers import AutoProcessor, SiglipImageProcessor
 import io
 import logging
+import json # Added for loading normalization stats
+from utils.misc import normalize # Added for normalization
 
 # Default image transformations - adapt as needed for PaliGemma
 # Typically, Paligemma might use a SigLIP image processor.
@@ -49,7 +51,8 @@ class VLADataset(Dataset):
                  use_siglip=True, # 新增参数，默认用siglip
                  siglip_model_name="google/siglip-base-patch16-224",
                  action_dim=7, 
-                 state_dim=7):
+                 state_dim=7,
+                 normalization_stats_path=None): # Added normalization_stats_path
         self.parquet_files = parquet_files if isinstance(parquet_files, list) else [parquet_files]
         self.max_seq_len = max_seq_len
         self.prompt_max_len = prompt_max_len
@@ -58,6 +61,27 @@ class VLADataset(Dataset):
         self.state_dim = state_dim
         self.use_siglip = use_siglip
         self.siglip_model_name = siglip_model_name
+        self.normalization_stats_path = normalization_stats_path
+        self.norm_stats = None
+
+        if self.normalization_stats_path:
+            try:
+                with open(self.normalization_stats_path, 'r') as f:
+                    self.norm_stats = json.load(f)
+                self.logger.info(f"Successfully loaded normalization stats from {self.normalization_stats_path}")
+                # Convert relevant parts to tensors for faster processing in __getitem__
+                if self.norm_stats:
+                    for key in ['state', 'action']:
+                        if key in self.norm_stats:
+                            for stat_type in ['min', 'max']:
+                                if stat_type in self.norm_stats[key]:
+                                    self.norm_stats[key][stat_type] = torch.tensor(self.norm_stats[key][stat_type], dtype=torch.float32)
+            except Exception as e:
+                self.logger.error(f"Error loading or parsing normalization stats from {self.normalization_stats_path}: {e}. Proceeding without normalization.")
+                self.norm_stats = None
+        else:
+            self.logger.info("No normalization_stats_path provided. Proceeding without normalization.")
+
 
         try:
             self.processor = AutoProcessor.from_pretrained(processor_name_or_path, trust_remote_code=True)
@@ -197,8 +221,53 @@ class VLADataset(Dataset):
         # 3. States and Actions
         states_list = [torch.tensor(step['state'], dtype=torch.float32) for step in sequence_data_raw]
         actions_list = [torch.tensor(step['action'], dtype=torch.float32) for step in sequence_data_raw]
-        states_padded = self._pad_modalities(states_list, self.max_seq_len, self.state_dim, torch.float32)
-        actions_padded = self._pad_modalities(actions_list, self.max_seq_len, self.action_dim, torch.float32)
+        
+        states_padded_orig = self._pad_modalities(states_list, self.max_seq_len, self.state_dim, torch.float32)
+        actions_padded_orig = self._pad_modalities(actions_list, self.max_seq_len, self.action_dim, torch.float32)
+
+        states_padded_normalized = states_padded_orig
+        actions_padded_normalized = actions_padded_orig
+
+        # Apply normalization if stats are available
+        if self.norm_stats:
+            if 'state' in self.norm_stats and self.norm_stats['state']['min'] is not None and self.norm_stats['state']['max'] is not None:
+                # Create a mask for valid (non-padded) steps before normalization
+                valid_steps_mask = torch.zeros(self.max_seq_len, dtype=torch.bool)
+                valid_steps_mask[:current_actual_seq_len] = True
+                
+                # Only normalize valid steps; padded steps remain zero (or their original padding value)
+                # which should be fine as (0 - min) / (max - min) - 1 will not be in [-1, 1] unless 0 is within original range.
+                # It's often better to normalize, then pad. But here data is padded first.
+                # So, we select valid steps, normalize, and then place them back or rely on broadcasting.
+                
+                # Normalize valid part of states_padded_orig
+                valid_states_to_norm = states_padded_orig[valid_steps_mask]
+                if valid_states_to_norm.numel() > 0: # Check if there are any valid states
+                    normalized_valid_states = normalize(valid_states_to_norm, 
+                                                        self.norm_stats['state']['min'], 
+                                                        self.norm_stats['state']['max'])
+                    # Create a new tensor for normalized states and fill it
+                    states_padded_normalized = torch.zeros_like(states_padded_orig)
+                    states_padded_normalized[valid_steps_mask] = normalized_valid_states
+                else: # If no valid states, keep as original (should be all zeros if padding was zero)
+                    states_padded_normalized = states_padded_orig
+
+
+            if 'action' in self.norm_stats and self.norm_stats['action']['min'] is not None and self.norm_stats['action']['max'] is not None:
+                valid_steps_mask = torch.zeros(self.max_seq_len, dtype=torch.bool) # Re-create for actions
+                valid_steps_mask[:current_actual_seq_len] = True
+
+                valid_actions_to_norm = actions_padded_orig[valid_steps_mask]
+                if valid_actions_to_norm.numel() > 0:
+                    normalized_valid_actions = normalize(actions_padded_orig[valid_steps_mask], 
+                                                         self.norm_stats['action']['min'], 
+                                                         self.norm_stats['action']['max'])
+                    actions_padded_normalized = torch.zeros_like(actions_padded_orig)
+                    actions_padded_normalized[valid_steps_mask] = normalized_valid_actions
+                else:
+                    actions_padded_normalized = actions_padded_orig
+
+
         # 4. VLM attention mask for valid (non-padded) sequence steps
         vlm_attention_mask = torch.zeros(self.max_seq_len, dtype=torch.bool)
         vlm_attention_mask[:current_actual_seq_len] = True
@@ -219,12 +288,28 @@ class VLADataset(Dataset):
         )
         # print(f"======state:{states_padded}\n")
         # print(f"======action:{actions_padded}\n")
+
+        # Log for debugging normalization
+        if self.norm_stats and current_actual_seq_len > 0: # Log only if stats loaded and sequence is not empty
+            # Log first valid original action (before padding and normalization)
+            original_action_first_step = actions_list[0]
+            # Log first valid normalized action (after normalization and padding)
+            normalized_action_first_step = actions_padded_normalized[0]
+            
+            self.logger.debug(f"Dataset ID: {idx} | Actual Seq Len: {current_actual_seq_len}")
+            self.logger.debug(f"  Action Original (first valid): {original_action_first_step.tolist()}")
+            self.logger.debug(f"  Action Normalized (first valid): {normalized_action_first_step.tolist()}")
+            if torch.allclose(original_action_first_step, normalized_action_first_step) and torch.norm(original_action_first_step) > 10: # Heuristic: if they are same and norm is large, norm likely failed
+                self.logger.warning(f"Dataset ID: {idx} - Normalized action seems same as original and has large norm. Normalization might not have been applied as expected.")
+                self.logger.warning(f"    Action Min Stats: {self.norm_stats['action']['min'].tolist()}")
+                self.logger.warning(f"    Action Max Stats: {self.norm_stats['action']['max'].tolist()}")
+
         return {
             "raw_prompt_text": raw_prompt_text,         # Raw text string
             "image_1": images_1_padded,                 # (max_seq_len, C, H, W)
             "image_2": images_2_padded,                 # (max_seq_len, C, H, W)
-            "state": states_padded,                     # (max_seq_len, D_state)
-            "action": actions_padded,                   # (max_seq_len, D_action)
+            "state": states_padded_normalized,           # Use normalized state
+            "action": actions_padded_normalized,         # Use normalized action as GT for training
             "input_ids_pure_text": tokenized_pure_text_prompt["input_ids"].squeeze(0), # (prompt_max_len)
             "attention_mask_pure_text": tokenized_pure_text_prompt["attention_mask"].squeeze(0).bool(), # (prompt_max_len)
             "vlm_attention_mask": vlm_attention_mask,   # (max_seq_len)

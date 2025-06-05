@@ -218,6 +218,34 @@ def get_lr_scheduler(optimizer, scheduler_config, logger=None, steps_per_epoch=N
         if logger: logger.error(f"Error creating LR scheduler {scheduler_type}: {e}", exc_info=True)
         return None
 
+def normalize(x, x_min, x_max, eps=1e-8):
+    """Normalize x to [-1, 1] using min and max values."""
+    # Ensure x_min and x_max are tensors
+    if not isinstance(x_min, torch.Tensor):
+        x_min = torch.tensor(x_min, dtype=x.dtype, device=x.device)
+    if not isinstance(x_max, torch.Tensor):
+        x_max = torch.tensor(x_max, dtype=x.dtype, device=x.device)
+    
+    # Reshape min/max to be broadcastable with x if x is (T, D) and min/max are (D,)
+    if x.ndim == 2 and x_min.ndim == 1 and x.shape[1] == x_min.shape[0]:
+        x_min = x_min.unsqueeze(0)
+        x_max = x_max.unsqueeze(0)
+        
+    return 2 * (x - x_min) / (x_max - x_min + eps) - 1
+
+def denormalize(x_norm, x_min, x_max):
+    """Denormalize x_norm from [-1, 1] to original scale."""
+    if not isinstance(x_min, torch.Tensor):
+        x_min = torch.tensor(x_min, dtype=x_norm.dtype, device=x_norm.device)
+    if not isinstance(x_max, torch.Tensor):
+        x_max = torch.tensor(x_max, dtype=x_norm.dtype, device=x_norm.device)
+
+    if x_norm.ndim == 2 and x_min.ndim == 1 and x_norm.shape[1] == x_min.shape[0]:
+        x_min = x_min.unsqueeze(0)
+        x_max = x_max.unsqueeze(0)
+        
+    return (x_norm + 1) / 2 * (x_max - x_min) + x_min
+
 if __name__ == '__main__':
     print("Testing utility functions:")
 
