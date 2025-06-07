@@ -13,13 +13,16 @@ from transformers import AutoTokenizer # For standalone text processing if neede
 from PIL import Image
 import io
 import numpy as np
+from utils.config_utils import OmegaConfAttrDict
+from torchvision import transforms
 
 class VLAPredictor:
-    def __init__(self, checkpoint_path, device=None, logger=None):
+    def __init__(self, checkpoint_path, config=None, device=None, logger=None):
         """
         Predictor for the Vision-Language-Action Model.
         Args:
-            checkpoint_path (str): Path to the model checkpoint file (.pth.tar).
+            checkpoint_path (str): Path to the model checkpoint file (.pth or .pth.tar).
+            config (dict, optional): Model configuration dictionary. If None, will try to load from checkpoint.
             device (str, optional): Device to run inference on ('cpu', 'cuda'). Autodetects if None.
             logger (logging.Logger, optional): Logger instance.
         """
@@ -35,236 +38,254 @@ class VLAPredictor:
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
         self.logger.info(f"Loading checkpoint from '{checkpoint_path}'")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu') 
         
-        self.config = checkpoint.get('config')
-        if not self.config:
-            # Try to load from old checkpoint format if config is not at top level
-            if checkpoint.get('model_config') and checkpoint.get('train_config'):
-                self.logger.warning("Loading config from older checkpoint format.")
-                self.config = {
-                    'model': checkpoint['model_config'],
-                    'training': checkpoint['train_config'],
-                    'data': checkpoint.get('data_config', {}), # Add data_config if present
-                    'optimizer': checkpoint.get('optimizer_config', {}), # Add optimizer_config if present
-                    'lr_scheduler': checkpoint.get('lr_scheduler_config', {})
-                }
-                # Convert to OmegaConfAttrDict if you were using it, otherwise basic dict is fine for access.
-                from utils.config_utils import OmegaConfAttrDict
-                self.config = OmegaConfAttrDict(self.config)
-            else:
-                raise ValueError("Config not found in checkpoint. Cannot initialize model.")
-
-        # Load normalization stats if path is in config
-        self.norm_stats = None
-        self.normalization_stats_path = self.config.data.get('normalization_stats_path', None)
-        if self.normalization_stats_path and os.path.isabs(self.normalization_stats_path):
-            # If absolute path is stored, use it directly
-            pass
-        elif self.normalization_stats_path:
-            # If relative, assume it's relative to the checkpoint's directory or a known root
-            # For simplicity, let's try relative to checkpoint dir first
-            potential_path = os.path.join(os.path.dirname(checkpoint_path), self.normalization_stats_path)
-            if os.path.exists(potential_path):
-                self.normalization_stats_path = potential_path
-            else:
-                # Fallback: assume it might be relative to CWD or a predefined project root if needed
-                # For now, if not found relative to checkpoint, it might fail later or use None.
-                self.logger.warning(f"Normalization stats path \"{self.normalization_stats_path}\" from config is relative. Tried relative to checkpoint, but {potential_path} not found. Ensure path is correct or absolute.")
-
-        if self.normalization_stats_path and os.path.exists(self.normalization_stats_path):
-            try:
-                with open(self.normalization_stats_path, 'r') as f:
-                    self.norm_stats = json.load(f)
-                self.logger.info(f"Successfully loaded normalization stats from {self.normalization_stats_path}")
-                if self.norm_stats:
-                    for key in ['state', 'action']:
-                        if key in self.norm_stats:
-                            for stat_type in ['min', 'max']:
-                                if stat_type in self.norm_stats[key]:
-                                    self.norm_stats[key][stat_type] = torch.tensor(self.norm_stats[key][stat_type], dtype=self.model_dtype) # Use model_dtype
-            except Exception as e:
-                self.logger.error(f"Error loading or parsing normalization stats from {self.normalization_stats_path}: {e}. Proceeding without denormalization capabilities for direct calls.")
-                self.norm_stats = None
-        elif self.normalization_stats_path:
-            self.logger.warning(f"Normalization stats file not found at resolved path: {self.normalization_stats_path}. Proceeding without denormalization capabilities for direct calls.")
+        # 加载检查点
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # 统一处理配置，确保是OmegaConfAttrDict类型
+        if config is None:
+            raise ValueError("Configuration must be provided to VLAPredictor.")
+        
+        if isinstance(config, dict) and not isinstance(config, OmegaConfAttrDict):
+            self.logger.warning("Configuration was a dict, converting to OmegaConfAttrDict for compatibility.")
+            self.config = OmegaConfAttrDict(config)
         else:
-            self.logger.info("No normalization_stats_path found in config. Denormalization will not be available internally.")
+            self.config = config
 
-        # Determine model dtype from config or default to float32 for CPU / float16 for CUDA
-        model_dtype_str = self.config.model.vlm_config.get('dtype', None) # Assuming dtype was stored in vlm_config
+        # --- 新增：加载归一化统计数据 ---
+        self.norm_stats = None
+        normalization_stats_path = self.config.data.get('normalization_stats_path', None)
+        if normalization_stats_path and os.path.exists(normalization_stats_path):
+            try:
+                with open(normalization_stats_path, 'r') as f:
+                    self.norm_stats = json.load(f)
+                self.logger.info(f"Successfully loaded normalization stats from {normalization_stats_path}")
+            except Exception as e:
+                self.logger.error(f"Error loading normalization stats: {e}", exc_info=True)
+        else:
+            self.logger.warning(f"Normalization stats file not found at path: {normalization_stats_path}. Action denormalization will be skipped.")
+
+        # --- 修正：模型初始化 ---
+        # 确定模型数据类型
+        model_dtype_str = self.config.model.vlm_config.get('dtype', 'torch.float32')
         if model_dtype_str == 'torch.float16':
             self.model_dtype = torch.float16
-        elif model_dtype_str == 'torch.float32':
-            self.model_dtype = torch.float32
+        elif model_dtype_str == 'torch.bfloat16':
+            self.model_dtype = torch.bfloat16
         else:
-            self.model_dtype = torch.float16 if self.device.type == 'cuda' else torch.float32
-        self.logger.info(f"Using model dtype: {self.model_dtype}")
-
-        # Initialize model with loaded configuration
-        self.model = VLAModel(
-            vlm_config=self.config['vlm_config'], 
-            action_head_config=self.config['action_head_config'],
-            device=self.device, # Will be moved to device within VLAModel
-            dtype=self.model_dtype
-        )
+            self.model_dtype = torch.float32
         
-        # Load model state dict (handling potential 'module.' prefix)
-        state_dict = checkpoint['state_dict']
+        # 初始化模型
+        self.model = VLAModel(
+            config=self.config,
+            model_logger=self.logger
+        ).to(self.device)
+        
+        # 加载模型参数
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+            
+        # 处理参数键名
         new_state_dict = {}
         for k, v in state_dict.items():
             name = k[7:] if k.startswith('module.') else k
             new_state_dict[name] = v
-        self.model.load_state_dict(new_state_dict)
-        self.model.to(self.device) # Ensure model is on the final device
+            
+        self.model.load_state_dict(new_state_dict, strict=False)
+        self.logger.info("Loaded state_dict with strict=False.")
+
+        # --- 新增：明确的成功加载日志 ---
+        num_loaded_params = sum(p.numel() for p in new_state_dict.values())
+        total_model_params = sum(p.numel() for p in self.model.state_dict().values())
+        self.logger.info(f"Successfully loaded {len(new_state_dict)} keys ({num_loaded_params/1e6:.2f}M params) into the model ({total_model_params/1e6:.2f}M params).")
+
         self.model.eval()
         self.logger.info("Model loaded successfully and set to eval mode.")
 
-        # For convenience if direct data prep is needed (though batch input is preferred)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config.get('data_config', {}).get('tokenizer_name_or_path', 'bert-base-uncased'))
-        # Assuming image processor config is compatible with VLAImageProcessor or a similar HF one was used.
-        img_proc_name = self.config.get('data_config', {}).get('image_processor_name_or_path', None)
-        if img_proc_name and 'vit' in img_proc_name.lower(): # Basic check for HF ViT processor
-            from transformers import AutoImageProcessor
-            try:
-                self.image_processor = AutoImageProcessor.from_pretrained(img_proc_name)
-            except Exception as e:
-                self.logger.warning(f"Could not load HF Image Processor {img_proc_name}: {e}. Using custom VLAImageProcessor.")
-                self.image_processor = VLAImageProcessor(image_size=self.config.get('data_config',{}).get('image_height', DEFAULT_IMAGE_SIZE))
-        else:
-            self.image_processor = VLAImageProcessor(image_size=self.config.get('data_config',{}).get('image_height', DEFAULT_IMAGE_SIZE))
+        # --- 核心修正：从模型中获取唯一的、正确的处理器 ---
+        self.processor = self.model.paligemma_vlm.processor
+        self.logger.info("Sourced the one true processor directly from the VLM submodule.")
 
-        self.num_action_bins = self.config['action_head_config']['num_action_bins']
-        self.action_bounds = self.config.get('action_bounds', (-1.0, 1.0))
+        # --- 修正模型属性获取路径 ---
+        self.num_action_bins = self.config.model.action_head_config.num_action_bins
+        self.action_bounds = self.config.data.get('action_bounds', [-1.0, 1.0])
 
-
-    def _preprocess_single_item(self, image_1_paths, prompt_text, image_2_paths=None, state_vector=None, max_seq_len=1, prompt_max_len=128):
+    def preprocess_images(self, image_1, image_2=None):
         """
-        Helper to preprocess a single data item (a sequence of one frame for typical inference).
-        This is a simplified version. For multi-frame sequences, adapt from VLADataset.
-        Args:
-            image_1_paths (list of str): List of paths to main camera images (for the sequence, usually 1 for single step).
-            prompt_text (str): Natural language prompt.
-            image_2_paths (list of str, optional): List of paths to wrist camera images.
-            state_vector (np.ndarray, optional): Robot state vector for the current step, shape (state_dim,).
-            max_seq_len (int): Sequence length to pad to (usually 1 for single step inference).
-            prompt_max_len (int): Max length for tokenized prompt.
-        Returns:
-            dict: A dictionary of tensors ready for model input.
+        重构: 使用模型自带的图像处理器将PIL图像转换为模型所需的张量。
         """
-        # Image processing
-        def process_imgs(img_paths_list):
-            processed = []
-            if not img_paths_list: return torch.empty(0)
-            for img_path in img_paths_list:
-                img = Image.open(img_path).convert("RGB")
-                if hasattr(self.image_processor, 'preprocess'): # HF processor
-                    processed.append(self.image_processor(images=img, return_tensors="pt")['pixel_values'].squeeze(0))
-                else: # Custom VLAImageProcessor
-                    # VLAImageProcessor expects bytes, so we simulate it for consistency
-                    byte_arr = io.BytesIO()
-                    img.save(byte_arr, format='PNG')
-                    processed.append(self.image_processor([byte_arr.getvalue()]).squeeze(0))
-            return torch.stack(processed) if processed else torch.empty(0)
+        def process_single_image(img):
+            if img is None:
+                return None
+            if isinstance(img, np.ndarray):
+                img = Image.fromarray(img)
+            # 使用 self.processor 的 image_processor 组件来处理图像
+            processed_inputs = self.processor.image_processor(images=img, return_tensors="pt")
+            return processed_inputs['pixel_values']
 
-        batch_image_1 = process_imgs(image_1_paths).unsqueeze(0) # (1, S, C, H, W)
-        batch_image_2 = process_imgs(image_2_paths).unsqueeze(0) if image_2_paths and self.model.paligemma_vlm.use_secondary_camera else None
+        # 处理主图像，返回 (1, C, H, W) 的张量
+        processed_image_1_tensor = process_single_image(image_1)
+        # 为其增加一个序列维度，以匹配模型 (B, T, C, H, W) 的输入格式
+        batch_image_1 = processed_image_1_tensor.unsqueeze(0)
 
-        # Text tokenization
-        tokenized_prompt = self.tokenizer(text=prompt_text, return_tensors="pt", padding="max_length", truncation=True, max_length=prompt_max_len)
-        batch_prompt_ids = tokenized_prompt["input_ids"]
-        batch_prompt_mask = tokenized_prompt["attention_mask"].bool()
+        batch_image_2 = None
+        if image_2 is not None:
+            processed_image_2_tensor = process_single_image(image_2)
+            batch_image_2 = processed_image_2_tensor.unsqueeze(0)
 
-        # State vector
+        return batch_image_1, batch_image_2
+
+    def preprocess_single_item_direct(self, image_1, prompt_text, image_2=None, state_vector=None):
+        """
+        重构: 该方法现在只负责收集原始数据，并将其打包成字典。
+        所有预处理将由模型内部完成。
+        """
+        # 将原始PIL Image包装成批次 (B, T, C, H, W) -> (1, 1, C, H, W)
+        # 注意：这里我们假设单次推理的序列长度为1 (T=1)
+        image_1_tensor = transforms.ToTensor()(image_1).unsqueeze(0).unsqueeze(0)
+        
+        image_2_tensor = None
+        if image_2 is not None:
+            image_2_tensor = transforms.ToTensor()(image_2).unsqueeze(0).unsqueeze(0)
+
+        # 将原始文本包装成列表
+        raw_prompt_texts_batch = [prompt_text]
+
+        # 处理状态向量
         batch_state = None
-        if state_vector is not None and self.model.action_head.use_state_input:
-            batch_state = torch.tensor(state_vector, dtype=self.model_dtype).unsqueeze(0).unsqueeze(0) # (1, 1, state_dim)
-            if max_seq_len > 1:
-                 batch_state = batch_state.repeat(1, max_seq_len, 1) # (1, S, state_dim)
-        
-        # VLM attention mask (assuming all frames in this short sequence are valid)
-        batch_vlm_mask = torch.ones((1, len(image_1_paths)), dtype=torch.bool)
-        
-        # Padding to max_seq_len (conceptual, actual padding might be more complex for sequences)
-        # This simple version assumes len(image_1_paths) <= max_seq_len
-        # For robust sequence padding, refer to VLADataset
-        # For single step inference, max_seq_len is often 1.
-        current_s = len(image_1_paths)
-        pad_s = max_seq_len - current_s
-        if pad_s < 0: pad_s = 0 # Should not happen if inputs are for single step or less than max_seq_len
+        if state_vector is not None and self.config.model.action_head_config.get('use_state_input', False):
+            state_tensor = torch.tensor(state_vector, dtype=torch.float32)
 
-        def pad_tensor(tensor, target_s_dim, val=0):
-            if tensor is None or tensor.shape[1] == target_s_dim : return tensor
-            padding = torch.full((tensor.shape[0], pad_s, *tensor.shape[2:]), val, dtype=tensor.dtype, device=tensor.device)
-            return torch.cat([tensor, padding], dim=1)
-
-        batch_image_1 = pad_tensor(batch_image_1, max_seq_len)
-        if batch_image_2 is not None: batch_image_2 = pad_tensor(batch_image_2, max_seq_len)
-        if batch_state is not None: batch_state = pad_tensor(batch_state, max_seq_len)
-        padding_mask = torch.zeros((1, pad_s), dtype=torch.bool, device=self.device)
-        batch_vlm_mask = torch.cat([batch_vlm_mask, padding_mask], dim=1) if pad_s > 0 else batch_vlm_mask
+            if self.norm_stats and 'state' in self.norm_stats:
+                state_stats = self.norm_stats['state']
+                min_vals = torch.tensor(state_stats['min'], dtype=torch.float32)
+                max_vals = torch.tensor(state_stats['max'], dtype=torch.float32)
+                
+                # 将状态归一化到 [-1, 1] 区间
+                normalized_state_tensor = 2 * (state_tensor - min_vals) / (max_vals - min_vals).clamp(min=1e-8) - 1
+                
+                self.logger.info("输入的状态向量已根据训练数据进行归一化。")
+                batch_state = normalized_state_tensor.unsqueeze(0).unsqueeze(0).to(self.device, dtype=self.model_dtype)
+            else:
+                self.logger.warning("未找到状态归一化统计数据。将使用原始状态向量。如果模型在归一化状态上训练，这可能导致性能不佳。")
+                batch_state = state_tensor.unsqueeze(0).unsqueeze(0).to(self.device, dtype=self.model_dtype)
         
+        # 创建VLM注意力掩码 (B, T)
+        batch_vlm_mask = torch.ones((1, 1), dtype=torch.bool)
+        
+        # 返回一个包含正确键值的字典
         return {
-            'image_1_batch': batch_image_1.to(self.device, dtype=self.model_dtype),
-            'image_2_batch': batch_image_2.to(self.device, dtype=self.model_dtype) if batch_image_2 is not None else None,
-            'prompt_input_ids': batch_prompt_ids.to(self.device),
-            'prompt_attention_mask': batch_prompt_mask.to(self.device),
+            'image_1_batch': image_1_tensor.to(self.device, dtype=self.model_dtype),
+            'image_2_batch': image_2_tensor.to(self.device, dtype=self.model_dtype) if image_2_tensor is not None else None,
+            'raw_prompt_text': raw_prompt_texts_batch,
             'vlm_attention_mask': batch_vlm_mask.to(self.device),
-            'state_batch': batch_state.to(self.device, dtype=self.model_dtype) if batch_state is not None else None
+            'state_batch': batch_state
         }
 
     def predict(self, batch):
+        """
+        此方法接收一个数据批次，执行必要的预处理（特别是文本分词），
+        然后调用模型进行推理。
+        """
+        # Ensure the model is in evaluation mode
         self.model.eval()
+
+        # The core prediction logic
         with torch.no_grad():
-            image_1_batch = batch['image_1'].to(self.device, dtype=self.model_dtype)
-            raw_prompt_texts_batch = batch['raw_prompt_text']
-            vlm_attention_mask = batch['vlm_attention_mask'].to(self.device)
-            state_batch = batch.get('state', None)
-            if state_batch is not None:
-                state_batch = state_batch.to(self.device, dtype=self.model_dtype) # state is now normalized, should match model_dtype
-            image_2_batch = batch.get('image_2', None)
-            if image_2_batch is not None:
-                image_2_batch = image_2_batch.to(self.device, dtype=self.model_dtype)
+            # Construct a clean input dictionary for the model, similar to the trainer.
+            # This avoids passing unexpected arguments to the model's forward pass.
+            model_input = {}
 
-            # Model outputs normalized actions if training was done with normalized actions
-            action_pred_normalized = self.model(
-                image_1_batch=image_1_batch,
-                raw_prompt_texts_batch=raw_prompt_texts_batch,
-                vlm_attention_mask_batch=vlm_attention_mask,
-                state_batch=state_batch, # This is the normalized state from DataLoader
-                image_2_batch=image_2_batch
-            )
+            # 1. Handle image inputs (from 'image_1' provided by dataloader, as in trainer)
+            if 'image_1' in batch:
+                model_input['image_1_batch'] = batch['image_1']
+            elif 'pixel_values' in batch: # Fallback for other potential data formats
+                model_input['image_1_batch'] = batch['pixel_values']
+            elif 'image_1_batch' in batch: # For single-item inference
+                model_input['image_1_batch'] = batch['image_1_batch']
+
+            if 'image_2' in batch:
+                model_input['image_2_batch'] = batch['image_2']
+            elif 'pixel_values_2' in batch: # Fallback for other potential data formats
+                model_input['image_2_batch'] = batch['pixel_values_2']
+            elif 'image_2_batch' in batch:
+                 model_input['image_2_batch'] = batch['image_2_batch']
+
+            # 2. Handle state input
+            if 'state' in batch:
+                model_input['state_batch'] = batch['state']
+            elif 'state_batch' in batch:
+                model_input['state_batch'] = batch['state_batch']
+
+            # 3. Handle VLM attention mask
+            if 'vlm_attention_mask' in batch:
+                model_input['vlm_attention_mask_batch'] = batch['vlm_attention_mask']
+
+            # 4. Handle text input (tokenizing raw text)
+            raw_texts = None
+            if 'prompt' in batch: # From dataset
+                raw_texts = batch['prompt']
+            elif 'raw_prompt_text' in batch: # From single-item inference
+                raw_texts = batch['raw_prompt_text']
+
+            if raw_texts:
+                if isinstance(raw_texts, str):
+                    raw_texts = [raw_texts]
+                
+                # The VLAModel's forward method expects raw text, which it passes to PaliGemmaVLM.
+                # Let's align with the trainer and VLAModel's forward signature.
+                model_input['raw_prompt_texts_batch'] = raw_texts
             
-            # The VLAPredictor itself will return the normalized prediction.
-            # Denormalization should happen in the script that calls the predictor and uses the action.
-            # This keeps VLAPredictor focused on prediction and VLAModel on its core logic.
+            # 5. Handle ground truth actions (not needed for prediction mode, but good practice to filter)
+            # 'actions_gt_seq' is the key expected by VLAModel.forward
+            if 'action' in batch:
+                 model_input['actions_gt_seq'] = batch['action']
+
+
+            # Filter out any None values before passing to the model
+            final_model_input = {k: v for k, v in model_input.items() if v is not None}
             
-            # For compatibility with existing main_eval.py that might expect discretized actions:
-            # If action_pred_normalized is (B, S, D_action_continuous)
-            # And original code expects bins, we might need to handle that.            
-            # Current VLAModel directly outputs continuous actions (or velocities if flow matching).
-            # The `discretize_actions` utility is separate.
-
-            # For now, assume `action_pred_normalized` is the continuous output.
-            # The `main_eval.py` script will be responsible for denormalizing it if needed.
-            # It might also discretize the original or denormalized version for some metrics.
-
-            # Prepare a dictionary similar to what main_eval.py might expect
-            # This part needs to align with how VLAModel output is structured and how main_eval consumes it.
-            # Assuming VLAModel.forward returns a tensor of shape (B, S, D_action_continuous)
+            # Now, call the model with the prepared input dictionary.
+            # The 'mode' argument is specific to our predictor logic, not the model itself.
+            predictions = self.model(**final_model_input)
+        
+        # --- DEBUG: 打印模型原始输出 ---
+        self.logger.info(f"模型原始输出 (反归一化前): {predictions.detach().cpu().numpy()}")
+        
+        # Post-process predictions
+        # The model now returns the predicted action sequence directly.
+        action_pred_normalized = predictions
+        
+        action_pred_denormalized = action_pred_normalized # Fallback value
+        if self.norm_stats and 'action' in self.norm_stats:
+            min_vals = self.norm_stats['action']['min']
+            max_vals = self.norm_stats['action']['max']
+            if not isinstance(min_vals, torch.Tensor):
+                min_vals = torch.tensor(min_vals, device=action_pred_denormalized.device)
+            if not isinstance(max_vals, torch.Tensor):
+                max_vals = torch.tensor(max_vals, device=action_pred_denormalized.device)
             
-            # Let's rename for clarity, this is still normalized.
-            predicted_actions_continuous_normalized = action_pred_normalized
+            action_min = min_vals.clone().detach().to(action_pred_denormalized.device)
+            action_max = max_vals.clone().detach().to(action_pred_denormalized.device)
 
-            # If main_eval.py needs binned actions, it should create them from the continuous ones.
-            # We can provide a placeholder or calculate if really needed here.
-            # For now, let main_eval handle discretization from continuous.
-            predicted_action_bins_placeholder = torch.zeros_like(predicted_actions_continuous_normalized, dtype=torch.long)
+            # Denormalize: from [-1, 1] to [min, max]
+            action_pred_denormalized = denormalize(action_pred_normalized, action_min, action_max)
+            # self.logger.info("Action denormalized using loaded stats.") # Too verbose for every step
+        else:
+            self.logger.warning("Normalization stats not found or invalid, returning model's raw [-1, 1] action predictions.")
 
-            return {
-                "predicted_actions_continuous": predicted_actions_continuous_normalized, # This is normalized
-                "predicted_action_bins": predicted_action_bins_placeholder # Placeholder, main_eval to generate if needed
-            }
+        # For single action prediction, we usually care about the first one in the sequence.
+        action = action_pred_denormalized[0, 0].cpu().numpy()
+
+        return {
+            "action": action,
+            "predicted_actions_continuous": action_pred_denormalized,
+            # The model output is continuous, bins are for metrics only.
+            # This can be computed in the main_eval script.
+            "predicted_action_bins": torch.zeros_like(action_pred_denormalized, dtype=torch.long) 
+        }
 
 # Example Usage (Conceptual)
 if __name__ == '__main__':
@@ -318,8 +339,8 @@ if __name__ == '__main__':
 
         # Use the predictor's preprocessing helper for a single step
         # Typically, for single-step inference, max_seq_len=1
-        single_item_preprocessed = predictor._preprocess_single_item(
-            image_1_paths=[dummy_img_path1],
+        single_item_preprocessed = predictor.preprocess_single_item_direct(
+            image_1=Image.open(dummy_img_path1).convert("RGB"),
             prompt_text="Pick up the red block.",
             max_seq_len=1, # For single step action prediction
             prompt_max_len=32

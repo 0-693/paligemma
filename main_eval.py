@@ -8,12 +8,50 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import json # For loading stats 
+from PIL import Image
+import random
+from omegaconf import OmegaConf
 
 from data.loader import VLADataset, vla_collate_fn # For loading evaluation datasets
 from torch.utils.data import DataLoader
 from inference.predictor import VLAPredictor
 from utils.misc import setup_logging, discretize_actions, undiscretize_actions, denormalize # Added denormalize
 from utils.config_utils import OmegaConfAttrDict # For config loading
+
+def get_default_config():
+    """获取与训练时兼容的默认配置"""
+    # 这个配置确保模型可以被正确构建，并且会从本地加载权重而不是下载
+    return {
+        'model': {
+            'vlm_config': {
+                'model_name_or_path': "./weight/paligemma-3b-pt-224",
+                'use_aux_camera': False,
+                'dtype': 'torch.bfloat16', # 与vla_config.yaml保持一致
+                'num_image_tokens': 256, # 显式设置以避免警告
+            },
+            'vision_resampler_config': { # 显式配置以避免警告
+                'type': 'mlp',
+                'output_dim': 2048, # 应与VLM的隐藏层大小匹配
+                'mlp_projector': {
+                    'hidden_dim': None # 模型内部可处理None
+                }
+            },
+            'action_head_config': {
+                'use_state_input': True,
+                'state_dim': 7, 
+                'num_action_dims': 7, 
+                'num_action_bins': 256, 
+                'hidden_layers_config': [1024, 512], # 使用正确的key
+                'dropout_prob': 0.1
+            }
+        },
+        'data': {
+            'tokenizer_name_or_path': "./weight/paligemma-3b-pt-224",
+            'image_processor_name_or_path': "./weight/paligemma-3b-pt-224",
+            'action_bounds': [-1.0, 1.0],
+            'normalization_stats_path': "normalization_stats.json" # 指向统计文件
+        }
+    }
 
 def calculate_metrics(all_pred_bins, all_true_bins, all_pred_continuous, all_true_continuous, vlm_masks, num_action_dims):
     """
@@ -107,10 +145,39 @@ def main(args):
     logger = setup_logging(log_file=log_file, name="VLAEvaluator")
     logger.info(f"Evaluation results will be saved in: {output_dir}")
 
+    # --- Load Config ---
+    # 首先，以默认配置为基础，这确保了所有必需的键都存在
+    base_config = OmegaConf.create(get_default_config())
+    config = base_config # 如果没有提供用户配置，则使用此默认配置
+
+    # 如果用户提供了配置文件路径，则加载并合并它
+    if args.config_path:
+        if os.path.exists(args.config_path):
+            try:
+                user_config = OmegaConf.load(args.config_path)
+                logger.info(f"Loaded user configuration from: {args.config_path}")
+                # 将用户配置合并到基础配置之上（用户的值会覆盖默认值）
+                config = OmegaConf.merge(base_config, user_config)
+                logger.info("User config successfully merged with default config.")
+            except Exception as e:
+                logger.error(f"Error loading or merging YAML config from '{args.config_path}': {e}. Exiting.", exc_info=True)
+                return
+        else:
+            # 如果提供了路径但文件不存在，这是一个致命错误
+            logger.error(f"Provided config file not found at: {args.config_path}. Exiting.")
+            return
+    else:
+        logger.warning("No config file path provided. Using hardcoded default config for model structure.")
+
     # --- Initialize Predictor ---
     logger.info(f"Initializing VLAPredictor with checkpoint: {args.checkpoint_path}")
     try:
-        predictor = VLAPredictor(checkpoint_path=args.checkpoint_path, device=args.device, logger=logger)
+        predictor = VLAPredictor(
+            checkpoint_path=args.checkpoint_path, 
+            config=config,
+            device=args.device, 
+            logger=logger
+        )
     except Exception as e:
         logger.error(f"Error initializing VLAPredictor: {e}", exc_info=True)
         return
@@ -138,34 +205,39 @@ def main(args):
     all_prompts = [] 
     # --- Process Data and Predict ---
     if args.eval_data_path: # Batch evaluation from dataset files
-        logger.info(f"Evaluating dataset from: {args.eval_data_path}")
-        eval_data_paths = args.eval_data_path # Expecting a list of parquet files
-        
-        # Use data configuration from the loaded model's checkpoint for consistency
-        data_conf = predictor.config.get('data_config', {})
-        if not data_conf:
-            logger.warning("Data config not found in checkpoint. Using default/arg values for dataloader.")
-        
+        logger.info(f"正在从以下路径加载评估数据集: {args.eval_data_path}")
         try:
+            # --- 核心修复：修正传递给VLADataset的参数 ---
+            common_dataset_params = {
+                # VLADataset 需要一个统一的 processor_name_or_path
+                "processor_name_or_path": config.model.vlm_config.model_name_or_path,
+                "max_seq_len": config.data.get('max_seq_len', 1),
+                "prompt_max_len": config.data.get('prompt_max_len', 77),
+                # 这些参数现在直接从action_head_config获取
+                "action_dim": config.model.action_head_config.num_action_dims,
+                "state_dim": config.model.action_head_config.state_dim,
+                "logger": logger,
+                "normalization_stats_path": config.data.get('normalization_stats_path', None),
+                # 可能还需要 use_siglip, siglip_model_name 等，如果您的 VLADataset 需要的话
+                # 暂时我们只包含最核心的参数
+            }
             eval_dataset = VLADataset(
-                parquet_files=eval_data_paths,
-                tokenizer_name_or_path=data_conf.get('tokenizer_name_or_path', 'bert-base-uncased'),
-                image_processor_name_or_path=data_conf.get('image_processor_name_or_path', 'google/vit-base-patch16-224-in21k'),
-                max_seq_len=data_conf.get('max_seq_len', args.max_seq_len_override or 32),
-                prompt_max_len=data_conf.get('prompt_max_len', args.prompt_max_len_override or 128)
+                parquet_files=args.eval_data_path,
+                **common_dataset_params
             )
+            # 注意：这里的 batch_size 设为 1，以便逐个样本进行对比
             eval_loader = DataLoader(
                 eval_dataset, 
-                batch_size=args.batch_size, 
+                batch_size=1, 
                 shuffle=False, 
                 collate_fn=vla_collate_fn, 
-                num_workers=args.num_workers or data_conf.get('num_workers', 0)
+                num_workers=args.num_workers or config.data.get('num_workers', 0)
             )
         except Exception as e:
             logger.error(f"Error initializing evaluation data loader: {e}", exc_info=True)
             return
 
-        logger.info(f"Evaluation dataset size: {len(eval_dataset)}. Batch size: {args.batch_size}")
+        logger.info(f"Evaluation dataset size: {len(eval_dataset)}. Batch size: {1}")
         progress_bar = tqdm(eval_loader, desc="Evaluating Batches")
         for batch_data in progress_bar:
             processed_batch = {}
@@ -224,64 +296,72 @@ def main(args):
                 ).cpu()
                 all_true_action_bins.append(true_bins)
 
-    elif args.image1_paths and args.prompt: # Single item inference
-        logger.info("Performing single item inference.")
-        img1_paths_list = args.image1_paths
-        if isinstance(args.image1_paths, str):
-            img1_paths_list = args.image1_paths.split(',')
+    else: # Single item inference mode (from args or random)
+        image_1 = None
+        image_2 = None
+        prompt = ""
+        state_vector = None
 
-        img2_paths_list = None
-        if args.image2_paths:
-            img2_paths_list = args.image2_paths
-            if isinstance(args.image2_paths, str):
-                img2_paths_list = args.image2_paths.split(',')
-
-        state_vec_orig = np.array(args.state_vector, dtype=np.float32) if args.state_vector and args.state_vector != 'None' else None
-        if state_vec_orig is not None and state_vec_orig.ndim == 0 : state_vec_orig = None
-        
-        state_vec_normalized = state_vec_orig
-        if state_vec_orig is not None and predictor.norm_stats and 'state' in predictor.norm_stats and \
-           predictor.norm_stats['state']['min'] is not None and predictor.norm_stats['state']['max'] is not None:
-            state_min_tensor = predictor.norm_stats['state']['min']
-            state_max_tensor = predictor.norm_stats['state']['max']
-            # Ensure tensors are on CPU for numpy conversion if they are not already
-            state_min_np = state_min_tensor.cpu().numpy() if isinstance(state_min_tensor, torch.Tensor) else np.array(state_min_tensor)
-            state_max_np = state_max_tensor.cpu().numpy() if isinstance(state_max_tensor, torch.Tensor) else np.array(state_max_tensor)
+        if args.image1_paths and args.prompt:
+            logger.info("Received single item inference request from command line.")
+            try:
+                if len(args.image1_paths) > 1:
+                    logger.warning(f"Multiple images provided, but current single-item mode only processes the first one. Using: {args.image1_paths[0]}")
+                image_1 = Image.open(args.image1_paths[0]).convert("RGB")
+                
+                if args.image2_paths:
+                    if len(args.image2_paths) > 1:
+                        logger.warning(f"Multiple wrist images provided, using the first one: {args.image2_paths[0]}")
+                    image_2 = Image.open(args.image2_paths[0]).convert("RGB")
+            except FileNotFoundError as e:
+                logger.error(f"Image file not found: {e}", exc_info=True)
+                return
             
-            # Apply normalization: x_norm = 2 * (x - min) / (max - min) - 1
-            state_vec_normalized = 2 * (state_vec_orig - state_min_np) / (state_max_np - state_min_np + 1e-8) - 1
-            logger.info("Single item state vector normalized.")
-        elif state_vec_orig is not None:
-            logger.warning("Normalization stats for state not available. Using original state vector for single item inference.")
+            prompt = args.prompt
+            state_vector = np.array(args.state_vector, dtype=np.float32) if args.state_vector else None
 
-        preprocessed_input = predictor._preprocess_single_item(
-            image_1_paths=img1_paths_list,
-            prompt_text=args.prompt,
-            image_2_paths=img2_paths_list,
-            state_vector=state_vec_normalized, # Pass the (potentially) normalized state
-            max_seq_len=args.max_seq_len_override or len(img1_paths_list),
-            prompt_max_len=args.prompt_max_len_override or 128
-        )
-        predictions_dict = predictor.predict(preprocessed_input)
-        pred_actions_continuous_normalized = predictions_dict['predicted_actions_continuous'].cpu()
-
-        pred_actions_denormalized = pred_actions_continuous_normalized # Default
-        if action_norm_stats and action_norm_stats['min'] is not None and action_norm_stats['max'] is not None:
-            action_min = action_norm_stats['min'].to(pred_actions_continuous_normalized.device)
-            action_max = action_norm_stats['max'].to(pred_actions_continuous_normalized.device)
-            pred_actions_denormalized = denormalize(pred_actions_continuous_normalized, action_min, action_max)
-            logger.info("Single item predicted action denormalized.")
         else:
-            logger.warning("Action norm stats not found. Using normalized action as denormalized for single item.")
+            logger.info("No input data provided. Running with randomly generated data.")
+            # 1. Generate random prompt
+            sample_prompts = ["pick up the red block", "push the green square to the left", "open the drawer", "place the can in the bin"]
+            prompt = random.choice(sample_prompts)
+            logger.info(f"Using random prompt: '{prompt}'")
+
+            # 2. Generate random images
+            image_1 = Image.new('RGB', (224, 224), color=(random.randint(0,255), random.randint(0,255), random.randint(0,255)))
+            logger.info("Generated random base image.")
+            
+            # Check if model uses a second camera
+            if predictor.config.model.vlm_config.get('use_aux_camera', False):
+                image_2 = Image.new('RGB', (224, 224), color=(random.randint(0,255), random.randint(0,255), random.randint(0,255)))
+                logger.info("Generated random wrist image.")
+
+            # 3. Generate random state vector
+            if predictor.config.model.action_head_config.get('use_state_input', False):
+                state_dim = predictor.config.model.action_head_config.get('state_dim', 7)
+                state_vector = np.random.rand(state_dim).astype(np.float32) * 2 - 1 # range [-1, 1]
+                logger.info(f"Generated random state vector (dim={state_dim})")
+
+        # --- Common logic for single item inference ---
+        logger.info("Performing single item inference.")
         
-        all_pred_actions_continuous_denorm.append(pred_actions_denormalized)
-        all_vlm_masks.append(preprocessed_input['vlm_attention_mask'].cpu()) 
-        all_prompts.append(args.prompt)
+        # ... (normalization of state_vector is fine) ...
 
-    else:
-        logger.error("No evaluation data provided. Please specify --eval_data_path or individual input args (--image1_paths, --prompt).")
-        return
+        preprocessed_input = predictor.preprocess_single_item_direct(
+            image_1=image_1,
+            prompt_text=prompt,
+            image_2=image_2,
+            state_vector=state_vector # 注意：这里传递原始的state_vector，predictor内部会处理
+        )
+        
+        predictions_dict = predictor.predict(preprocessed_input)
+        action_denormalized = predictions_dict['action']
+        logger.info(f"Predicted Action (denormalized): {action_denormalized}")
 
+        all_pred_actions_continuous_denorm.append(torch.tensor(action_denormalized).unsqueeze(0).unsqueeze(0))
+        all_vlm_masks.append(preprocessed_input['vlm_attention_mask'].cpu())
+        all_prompts.append(prompt)
+    
     # --- Calculate and Log Metrics (if true labels were available) ---
     if all_true_actions_continuous_gt_norm: # Check if we have GT actions (these are normalized from VLADataset)
         logger.info("Calculating metrics...")
@@ -379,7 +459,9 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Evaluate or Run Inference with VLA Model")
     parser.add_argument('--checkpoint_path', type=str, required=True, 
-                        help='Path to the VLA model checkpoint (.pth.tar). Contains model, config.')
+                        help='Path to the VLA model checkpoint (.pth.tar or .pth).')
+    parser.add_argument('--config_path', type=str, default=None,
+                        help='Path to the model YAML configuration file. If not provided, a default is used.')
     
     # Group for batch evaluation from dataset files
     eval_group = parser.add_argument_group('Dataset Evaluation Arguments')

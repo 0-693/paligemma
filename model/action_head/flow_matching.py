@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 class SinusoidalPositionalEncoding(nn.Module):
     """Sinusoidal positional encoding for sequence positions or time steps."""
@@ -92,6 +93,10 @@ class CategorySpecificMLP(nn.Module):
         self.activation = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor, category_id: torch.LongTensor):
+        # --- 核心修复：在进入网络前，确保输入张量的数据类型正确 ---
+        # 网络的权重是Float32，因此需要将输入转换为Float32
+        x = x.to(torch.float32)
+        
         # Apply first layer with activation
         out = self.activation(self.fc1(x, category_id))
         # Second layer (linear output, no activation by default)

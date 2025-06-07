@@ -128,7 +128,7 @@ class PaliGemmaVLM(nn.Module):
 
     def _process_single_frame_batch_input(
         self, 
-        images_for_frame, # Batch of images for current frame: (B, C, H, W) or list of B PIL images
+        images_for_frame, # Batch of images for current frame: (B, C, H, W)
         batch_raw_prompt_texts, # List of B raw prompt strings
         device
     ):
@@ -136,13 +136,23 @@ class PaliGemmaVLM(nn.Module):
         Processes a batch of single frames and corresponding text prompts using self.processor.
         The processor handles tokenizing text, adding special image tokens, and processing images.
         """
-        # 修正：如果输入是Tensor，需转为PIL Image
-        if isinstance(images_for_frame, torch.Tensor):
-            images_for_frame = [transforms.ToPILImage()(img.cpu()) for img in images_for_frame]
+        # --- 核心修复：接收(B, C, H, W)张量，并安全地转换为PIL Image列表 ---
+        processed_images = []
+        if images_for_frame is not None:
+            # images_for_frame is a batch tensor (B, C, H, W)
+            # We need to convert each image in the batch to a PIL Image
+            for i in range(images_for_frame.shape[0]):
+                img_tensor = images_for_frame[i]
+                # 转换前确保数据类型和值范围正确
+                img_tensor_float = img_tensor.cpu().to(torch.float32)
+                # ToPILImage期望(C,H,W)且值在[0,1]范围，我们的ToTensor()已保证这一点
+                pil_img = transforms.ToPILImage()(img_tensor_float)
+                processed_images.append(pil_img)
+        
         try:
             inputs = self.processor(
                 text=batch_raw_prompt_texts,
-                images=images_for_frame, # 现在保证是PIL Image列表
+                images=processed_images if processed_images else None, # 传递PIL Image列表
                 return_tensors="pt",
                 padding="longest",
                 truncation=True,
