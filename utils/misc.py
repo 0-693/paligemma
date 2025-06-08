@@ -95,7 +95,7 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar', best_filename
         shutil.copyfile(filename, best_filename)
         print(f"Saved new best model to {best_filename}")
 
-def load_checkpoint(model, optimizer=None, filename='checkpoint.pth.tar', device='cpu'):
+def load_checkpoint(model, optimizer=None, filename='checkpoint.pth.tar', device='cpu', strict=True):
     """
     Loads model and training parameters from a checkpoint file.
     Args:
@@ -103,6 +103,7 @@ def load_checkpoint(model, optimizer=None, filename='checkpoint.pth.tar', device
         optimizer (torch.optim.Optimizer, optional): Optimizer instance.
         filename (str): Path to the checkpoint file.
         device (str): Device to load the model to ('cpu' or 'cuda').
+        strict (bool): Whether to strictly enforce that the keys in state_dict match the keys returned by this module’s state_dict(). Default True.
     Returns:
         int: Start epoch for training (or epoch of the loaded model).
         float: Best metric score recorded (if available in checkpoint, else 0.0).
@@ -126,7 +127,15 @@ def load_checkpoint(model, optimizer=None, filename='checkpoint.pth.tar', device
         else:
             name = k
         new_state_dict[name] = v
-    model.load_state_dict(new_state_dict)
+    
+    # Pass the strict argument to load_state_dict
+    missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=strict)
+    
+    if missing_keys:
+        print(f"Warning: Missing keys in state_dict: {missing_keys}")
+    if unexpected_keys:
+        print(f"Warning: Unexpected keys in state_dict: {unexpected_keys}")
+        
     model.to(device) # Ensure model is on the correct device after loading
 
     if optimizer and 'optimizer' in checkpoint:
@@ -342,4 +351,4 @@ if __name__ == '__main__':
         os.remove(logger_test_file)
         print(f"Cleaned up dummy log file: {logger_test_file}")
         
-    print("\nAll utility tests completed.") 
+    print("\nAll utility tests completed.")

@@ -230,19 +230,28 @@ class VLATrainer:
             # Save checkpoint
             checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pth")
             state = {
-                'epoch': epoch + 1,
+                'epoch': epoch + 1, # epoch completed (0-indexed becomes 1-indexed for saving)
                 'state_dict': self.model.state_dict(),
                 'optimizer': self.optimizer.state_dict(),
                 'lr_scheduler': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
+                'best_metric': self.best_val_loss # Always save the current best_val_loss
             }
-            save_checkpoint(state, is_best=False, filename=checkpoint_path)
+            # The is_best flag for save_checkpoint is only for copying to a separate 'best_model.pth.tar' file.
+            # The main checkpoint file (e.g., checkpoint_epoch_X.pth) will now always contain a best_metric field.
+            save_checkpoint(state, is_best=False, filename=checkpoint_path) # Regular epoch checkpoint
 
             # Save best model based on validation loss
-            if val_loss is not None and val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
+            current_val_loss_for_comparison = val_loss if val_loss is not None else float('inf')
+            if current_val_loss_for_comparison < self.best_val_loss:
+                self.logger.info(f"New best validation loss: {current_val_loss_for_comparison:.4f} (previous: {self.best_val_loss:.4f}). Saving best model.")
+                self.best_val_loss = current_val_loss_for_comparison
+                # Update state dict with the new best_val_loss before saving the best model checkpoint
+                # This is redundant if state was already created with self.best_val_loss, but good for clarity
+                state['best_metric'] = self.best_val_loss 
                 best_checkpoint_path = os.path.join(self.checkpoint_dir, "checkpoint_best_val.pth")
-                save_checkpoint(state, is_best=True, filename=best_checkpoint_path)
-                self.logger.info(f"Saved new best validation model (Epoch {epoch + 1}, Val Loss: {val_loss:.4f}) to {best_checkpoint_path}")
+                # Pass is_best=True to also copy it to model_best.pth.tar or similar
+                save_checkpoint(state, is_best=True, filename=best_checkpoint_path) 
+                self.logger.info(f"Saved new best validation model (Epoch {epoch + 1}, Val Loss: {self.best_val_loss:.4f}) to {best_checkpoint_path}")
             elif val_loss is None and self.val_dataloader is None: # If no validation, save based on train loss (e.g. save every N epochs or last one)
                  # For now, just saving epoch checkpoint is enough. Could add logic to save based on train_loss if desired.
                  pass 
@@ -393,4 +402,4 @@ if __name__ == '__main__':
         if os.path.exists(config['checkpoint_dir']): shutil.rmtree(config['checkpoint_dir'])
         if os.path.exists(config['data_config']['train_parquet_files'][0]): os.remove(config['data_config']['train_parquet_files'][0])
         if os.path.exists(config['data_config']['val_parquet_files'][0]): os.remove(config['data_config']['val_parquet_files'][0])
-        logger.info("Cleaned up dummy files and directories.") 
+        logger.info("Cleaned up dummy files and directories.")

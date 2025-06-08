@@ -185,15 +185,43 @@ def main(args):
 
     # --- Checkpoint Loading (Resumption) --- #
     start_epoch = 0
+    resumed_best_metric = None # Variable to store best_metric from checkpoint
+
     if args.resume_checkpoint:
         if os.path.isfile(args.resume_checkpoint):
             logger.info(f"Resuming training from checkpoint: {args.resume_checkpoint}")
-            start_epoch, _ = load_checkpoint(args.resume_checkpoint, vla_model, optimizer, lr_scheduler, logger, device)
-            logger.info(f"Resumed from epoch {start_epoch}")
+            
+            # Call the modified load_checkpoint function
+            # Signature: load_checkpoint(model, optimizer=None, filename='checkpoint.pth.tar', device='cpu', strict=True)
+            # It returns the epoch number *completed* (0-indexed) and the best_metric.
+            epoch_completed_from_ckpt, best_metric_from_ckpt = load_checkpoint(
+                model=vla_model, 
+                optimizer=optimizer, 
+                filename=args.resume_checkpoint, 
+                device=device, 
+                strict=True # For training resumption, model structure should strictly match
+            )
+            
+            start_epoch = epoch_completed_from_ckpt + 1 # Training starts from the next epoch (0-indexed)
+            resumed_best_metric = best_metric_from_ckpt # Store for trainer initialization
+
+            # Load LR scheduler state separately by loading the checkpoint file again
+            checkpoint_data = torch.load(args.resume_checkpoint, map_location=device)
+            if lr_scheduler and 'lr_scheduler' in checkpoint_data:
+                try:
+                    lr_scheduler.load_state_dict(checkpoint_data['lr_scheduler'])
+                    logger.info(f"Successfully loaded LR scheduler state from checkpoint.")
+                except Exception as e:
+                    logger.warning(f"Could not load LR scheduler state from checkpoint: {e}. LR scheduler may start from scratch.")
+            elif lr_scheduler: # If lr_scheduler exists but its state is not in checkpoint
+                logger.info("LR scheduler state not found in checkpoint. LR scheduler may start from scratch.")
+            
+            logger.info(f"Resumed from checkpoint. Training will start at epoch {start_epoch} (0-indexed). "
+                        f"Previous best metric: {resumed_best_metric if resumed_best_metric is not None else 'N/A'}")
         else:
-            logger.warning(f"Resume checkpoint not found: {args.resume_checkpoint}. Starting from scratch.")
+            logger.warning(f"Resume checkpoint not found: {args.resume_checkpoint}. Starting from scratch. Training will start from epoch 0.")
     else:
-        logger.info("No checkpoint provided for resumption. Starting training from scratch.")
+        logger.info("No checkpoint provided for resumption. Starting training from scratch at epoch 0.")
 
     # --- Trainer Initialization and Training --- #
     logger.info("Initializing VLATrainer...")
@@ -208,10 +236,19 @@ def main(args):
         logger=logger, # Pass the main logger
         model_dtype=vla_model.paligemma_vlm.dtype # Pass model's dtype for autocast
     )
+    
+    # If resumed and a best_metric was loaded, set it in the trainer
+    # This assumes VLATrainer has a 'best_metric' attribute.
+    if resumed_best_metric is not None:
+        trainer.best_metric = resumed_best_metric 
+        logger.info(f"Trainer's best_metric initialized to {resumed_best_metric} from checkpoint.")
+
     logger.info("VLATrainer initialized.")
 
     try:
-        logger.info(f"Starting training from epoch {start_epoch + 1} for {config.training.epochs} epochs...")
+        # start_epoch is the 0-indexed epoch to begin training from.
+        # The log message uses start_epoch + 1 for 1-indexed human-readable display.
+        logger.info(f"Starting training from epoch {start_epoch + 1} (1-indexed) for {config.training.epochs} total epochs...")
         trainer.train(start_epoch=start_epoch) # VLATrainer's train method will handle epochs
         logger.info("Training completed successfully.")
     except Exception as e:
@@ -257,4 +294,4 @@ if __name__ == "__main__":
     # base_logger = logging.getLogger(__name__)
     # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-    main(args) 
+    main(args)

@@ -76,6 +76,13 @@ class VLAPredictor:
             self.model_dtype = torch.float32
         
         # 初始化模型
+        # 添加关键调试信息
+        self.logger.info("=== 模型配置调试信息 ===")
+        self.logger.info(f"action_head_config: {self.config.model.action_head_config}")
+        self.logger.info(f"horizon: {self.config.model.action_head_config.get('horizon', 'NOT_SET')}")
+        self.logger.info(f"action_dim: {self.config.model.action_head_config.get('action_dim', 'NOT_SET')}")
+        self.logger.info(f"max_seq_len: {self.config.data.get('max_seq_len', 'NOT_SET')}")
+        
         self.model = VLAModel(
             config=self.config,
             model_logger=self.logger
@@ -137,23 +144,37 @@ class VLAPredictor:
 
         return batch_image_1, batch_image_2
 
-    def preprocess_single_item_direct(self, image_1, prompt_text, image_2=None, state_vector=None):
+    def preprocess_single_item_direct(self, image_1, prompt_text, image_2=None, state_vector=None, max_seq_len=None):
         """
         重构: 该方法现在只负责收集原始数据，并将其打包成字典。
         所有预处理将由模型内部完成。
+        
+        Args:
+            image_1: 主相机图像
+            prompt_text: 文本指令
+            image_2: 可选的第二个相机图像
+            state_vector: 机器人状态向量
+            max_seq_len: 序列长度，用于创建正确的时间维度
         """
-        # 将原始PIL Image包装成批次 (B, T, C, H, W) -> (1, 1, C, H, W)
-        # 注意：这里我们假设单次推理的序列长度为1 (T=1)
-        image_1_tensor = transforms.ToTensor()(image_1).unsqueeze(0).unsqueeze(0)
+        # 从配置获取序列长度，如果未提供参数的话
+        if max_seq_len is None:
+            max_seq_len = self.config.data.get('max_seq_len', 4)
+        
+        # 将原始PIL Image包装成批次 (B, T, C, H, W) -> (1, T, C, H, W)
+        # 注意：这里我们为单次推理复制图像到每个时间步
+        image_1_tensor = transforms.ToTensor()(image_1).unsqueeze(0)  # (1, C, H, W)
+        # 复制到所有时间步: (1, T, C, H, W)
+        image_1_tensor = image_1_tensor.unsqueeze(1).repeat(1, max_seq_len, 1, 1, 1)
         
         image_2_tensor = None
         if image_2 is not None:
-            image_2_tensor = transforms.ToTensor()(image_2).unsqueeze(0).unsqueeze(0)
+            image_2_tensor = transforms.ToTensor()(image_2).unsqueeze(0)  # (1, C, H, W)
+            image_2_tensor = image_2_tensor.unsqueeze(1).repeat(1, max_seq_len, 1, 1, 1)  # (1, T, C, H, W)
 
         # 将原始文本包装成列表
         raw_prompt_texts_batch = [prompt_text]
 
-        # 处理状态向量
+        # 处理状态向量，复制到所有时间步
         batch_state = None
         if state_vector is not None and self.config.model.action_head_config.get('use_state_input', False):
             state_tensor = torch.tensor(state_vector, dtype=torch.float32)
@@ -167,13 +188,15 @@ class VLAPredictor:
                 normalized_state_tensor = 2 * (state_tensor - min_vals) / (max_vals - min_vals).clamp(min=1e-8) - 1
                 
                 self.logger.info("输入的状态向量已根据训练数据进行归一化。")
-                batch_state = normalized_state_tensor.unsqueeze(0).unsqueeze(0).to(self.device, dtype=self.model_dtype)
+                # 复制状态到所有时间步: (1, T, state_dim)
+                batch_state = normalized_state_tensor.unsqueeze(0).unsqueeze(0).repeat(1, max_seq_len, 1).to(self.device, dtype=self.model_dtype)
             else:
                 self.logger.warning("未找到状态归一化统计数据。将使用原始状态向量。如果模型在归一化状态上训练，这可能导致性能不佳。")
-                batch_state = state_tensor.unsqueeze(0).unsqueeze(0).to(self.device, dtype=self.model_dtype)
+                # 复制状态到所有时间步: (1, T, state_dim)
+                batch_state = state_tensor.unsqueeze(0).unsqueeze(0).repeat(1, max_seq_len, 1).to(self.device, dtype=self.model_dtype)
         
-        # 创建VLM注意力掩码 (B, T)
-        batch_vlm_mask = torch.ones((1, 1), dtype=torch.bool)
+        # 创建VLM注意力掩码 (B, T) - 所有时间步都有效
+        batch_vlm_mask = torch.ones((1, max_seq_len), dtype=torch.bool)
         
         # 返回一个包含正确键值的字典
         return {
@@ -276,15 +299,12 @@ class VLAPredictor:
         else:
             self.logger.warning("Normalization stats not found or invalid, returning model's raw [-1, 1] action predictions.")
 
-        # For single action prediction, we usually care about the first one in the sequence.
-        action = action_pred_denormalized[0, 0].cpu().numpy()
-
         return {
-            "action": action,
+            "action": action_pred_denormalized,  # 返回完整的action sequence
             "predicted_actions_continuous": action_pred_denormalized,
-            # The model output is continuous, bins are for metrics only.
-            # This can be computed in the main_eval script.
-            "predicted_action_bins": torch.zeros_like(action_pred_denormalized, dtype=torch.long) 
+            "vlm_attention_mask": model_input.get('vlm_attention_mask_batch', 
+                torch.ones((action_pred_denormalized.shape[0], action_pred_denormalized.shape[1]), 
+                          dtype=torch.bool, device=action_pred_denormalized.device))
         }
 
 # Example Usage (Conceptual)
