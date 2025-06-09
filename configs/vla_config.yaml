@@ -5,10 +5,10 @@
 data:
   # Path to the directory containing training Parquet files, or a list of specific Parquet file paths.
   # If a directory is provided, all .parquet files within that directory will be loaded.
-  train_parquet_files: "/root/private_data/dataset/xarm6_parquet/training/" # Placeholder: e.g., "/path/to/calvin_dataset/train/"
+  train_parquet_files: "/root/private_data/dataset/xarm6_pick_oreo/training/" # Placeholder: e.g., "/path/to/calvin_dataset/train/"
 
   # (Optional) Path to the directory containing validation Parquet files.
-  val_parquet_files: "/root/private_data/dataset/xarm6_parquet/validation/"   # Placeholder: e.g., "/path/to/calvin_dataset/val/"
+  val_parquet_files: "/root/private_data/dataset/xarm6_pick_oreo/validation/"   # Placeholder: e.g., "/path/to/calvin_dataset/val/"
 
   # Tokenizer: Should match the VLM backbone.
   # For PaliGemma, this is usually the same as the model identifier.
@@ -38,7 +38,7 @@ data:
   # RoboVLMs act_head uses min_action: -1, max_action: 1.
   action_bounds: [-1.0, 1.0]
 
-  normalization_stats_path: "normalization_stats_parquet.json"
+  normalization_stats_path: "normalization_stats.json"
 
 # --- Model Configuration ---
 model:
@@ -102,13 +102,13 @@ model:
     num_action_dims: 7
 
     # Action sequence horizon - CORRECTED: trained model uses single-step actions
-    horizon: 1  # Must match data.max_seq_len for consistent training/inference
+    horizon: 4  # Must match data.max_seq_len for consistent training/inference
 
     # Per-step action dimension (single action step dimension)
     per_action_dim: 7  # Single step action dimension
 
     # Total action dimension (horizon * per_action_dim)
-    action_dim: 7  # 1 step * 7 dims = 7 total dimensions
+    action_dim: 28  # 1 step * 7 dims = 7 total dimensions
 
     # State dimension for robot state vector
     state_dim: 7

@@ -1,0 +1,139 @@
+# Multi-GPU Distributed Training Configuration for VLA Model
+# Based on vla_config.yaml with optimizations for distributed training across 4x NVIDIA A800 80GB GPUs
+
+# --- Data Configuration ---
+data:
+  # Path to the directory containing training Parquet files, or a list of specific Parquet file paths.
+  # If a directory is provided, all .parquet files within that directory will be loaded.
+  train_parquet_files: "/root/private_data/dataset/xarm6_pick_oreo/training/"
+
+  # (Optional) Path to the directory containing validation Parquet files.
+  val_parquet_files: "/root/private_data/dataset/xarm6_pick_oreo/validation/"
+
+  # Tokenizer: Should match the VLM backbone.
+  # For PaliGemma, this is usually the same as the model identifier.
+  tokenizer_name_or_path: "./weight/paligemma-3b-pt-224"
+
+  # Image Processor: Should match the VLM backbone.
+  image_processor_name_or_path: "./weight/paligemma-3b-pt-224"
+
+  # SigLIP model for image processing (required by VLADataset)
+  siglip_model_name: "google/siglip-base-patch16-224"
+
+  # Max sequence length (window size) for model input.
+  max_seq_len: 4
+
+  # Max length for tokenized prompts.
+  prompt_max_len: 77
+
+  # Batch size for training and validation - optimized for multi-GPU
+  # This is the TOTAL batch size across all GPUs (will be divided automatically)
+  # With 4 GPUs: 20 total = 5 per GPU (same effective batch size as single GPU config)
+  batch_size: 20
+
+  # Number of worker processes for DataLoader per GPU.
+  num_workers: 4
+
+  # Action bounds for continuous action discretization.
+  action_bounds: [-1.0, 1.0]
+
+  # Data normalization stats
+  normalization_stats_path: "normalization_stats.json"
+
+# --- Model Configuration ---
+model:
+  vlm_config:
+    # PaliGemma model from local weight directory
+    model_name_or_path: "./weight/paligemma-3b-pt-224" 
+
+    # Whether to use auxiliary camera input (image_2 from dataset).
+    use_aux_camera: False 
+
+    # Freeze vision tower weights (image encoder).
+    freeze_vision_tower: False
+
+    # Freeze language model weights.
+    freeze_language_model: False
+
+    # Data type for the VLM model - bfloat16 for memory efficiency
+    dtype: "torch.bfloat16"
+  
+  # Configuration for the vision encoder modules within PaliGemmaVLM wrapper
+  vision_encoder_config:
+    # Vision Tower settings (conceptual for integrated PaliGemma)
+    vision_tower:
+      pass
+
+    # Vision Resampler settings
+    vision_resampler:
+      type: "mlp"
+      mlp_projector:
+        hidden_dim: null
+
+  # Action head configuration - CORRECTED for single-step actions
+  action_head_config:
+    # Whether to concatenate robot state vector with VLM embeddings.
+    use_state_input: True
+
+    # Number of dimensions in the action vector.
+    num_action_dims: 7
+
+    # Action sequence horizon - single-step actions (must match dataset)
+    horizon: 8
+
+    # Per-step action dimension (single action step dimension)
+    per_action_dim: 7
+
+    # Total action dimension (horizon * per_action_dim)
+    action_dim: 56 # 8 * 7 = 56 (for single-step actions)
+
+    # State dimension for robot state vector
+    state_dim: 7
+
+    # Number of discrete bins per action dimension.
+    num_action_bins: 256 
+
+    # MLP hidden layers for the action head.
+    hidden_layers_config: [1024, 512] 
+
+    # Dropout probability for the action head MLP.
+    dropout_prob: 0.1
+
+# --- Training Configuration ---
+training:
+  # Number of training epochs - increased for distributed training
+  epochs: 10
+
+  # Log training progress every N batches.
+  log_interval: 10
+
+  # Root directory to save model checkpoints and logs.
+  checkpoint_dir: "./experiments/" 
+
+  # Experiment name (subdirectory under checkpoint_dir).
+  experiment_name: "paligemma_vla_ddp_finetune"
+
+  # Gradient clipping norm.
+  grad_clip_norm: 1.0
+
+  # Random seed for reproducibility
+  seed: 123
+
+# --- Optimizer Configuration ---
+optimizer:
+  # Optimizer type.
+  type: "AdamW"
+
+  # Learning rate - scaled for distributed training
+  # Base LR from single-GPU config: 2e-5
+  # For 4 GPUs with total batch size 20: keep same LR since effective batch size per GPU is same
+  lr: 2.0e-5
+
+  # Weight decay.
+  weight_decay: 0.01
+
+# --- Learning Rate Scheduler Configuration ---
+lr_scheduler:
+  type: "CosineAnnealingLR" 
+  T_max: 10 # Corresponds to training.epochs for one cosine cycle
+  eta_min: 2.0e-7 # Minimum learning rate (0.01 * lr)

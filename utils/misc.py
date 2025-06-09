@@ -70,6 +70,8 @@ def setup_logging(log_level=logging.INFO, log_file=None, name='VLATrainer'):
 
     # File handler (optional)
     if log_file:
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
         fh = logging.FileHandler(log_file)
         fh.setLevel(log_level)
         fh.setFormatter(formatter)

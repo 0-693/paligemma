@@ -95,17 +95,53 @@ class VLAModel(nn.Module):
     def forward(self, image_1_batch, raw_prompt_texts_batch, vlm_attention_mask_batch, 
                   state_batch=None, image_2_batch=None, actions_gt_seq=None):
         """
-        Main forward pass. Produces a sequence of action predictions.
+        Main forward pass. For multi-step action prediction, predicts one multi-step action sequence per sample.
         Args:
-            image_1_batch (torch.Tensor): (B, T, C, H, W)
+            image_1_batch (torch.Tensor): (B, S, C, H, W) or (B, C, H, W) - image sequences or single images
             raw_prompt_texts_batch (list[str]): List of B prompts.
-            vlm_attention_mask_batch (torch.Tensor): (B, T) VLM attention mask.
-            state_batch (torch.Tensor, optional): (B, T, D_state)
-            image_2_batch (torch.Tensor, optional): (B, T, C, H, W)
-            actions_gt_seq (torch.Tensor, optional): (B, T, D_action_per_step) Ground truth actions.
+            vlm_attention_mask_batch (torch.Tensor): (B, S) or (B,) - attention mask
+            state_batch (torch.Tensor, optional): (B, S, D_state) or (B, D_state) - state sequences or single states  
+            image_2_batch (torch.Tensor, optional): (B, S, C, H, W) or (B, C, H, W) - optional second images
+            actions_gt_seq (torch.Tensor, optional): (B, action_dim) - flattened multi-step actions for training
         Returns:
-            torch.Tensor: Predicted actions sequence (B, T, D_action_output).
+            torch.Tensor: Predicted multi-step actions (B, action_dim).
         """
+        # For multi-step action prediction, we use the most recent observation (last frame)
+        # to predict future action sequence
+        
+        # Handle both sequence and single image formats
+        if len(image_1_batch.shape) == 5:  # (B, S, C, H, W) - take last frame
+            image_1_batch = image_1_batch[:, -1]  # (B, C, H, W)
+        elif len(image_1_batch.shape) == 4:  # (B, C, H, W) - already single images
+            pass
+        else:
+            raise ValueError(f"Unexpected image_1_batch shape: {image_1_batch.shape}")
+            
+        if image_2_batch is not None:
+            if len(image_2_batch.shape) == 5:  # (B, S, C, H, W) - take last frame
+                image_2_batch = image_2_batch[:, -1]  # (B, C, H, W)
+            elif len(image_2_batch.shape) == 4:  # (B, C, H, W) - already single images
+                pass
+            else:
+                raise ValueError(f"Unexpected image_2_batch shape: {image_2_batch.shape}")
+        
+        # Handle state batch - take current state (last frame's corresponding state)
+        if state_batch is not None:
+            if len(state_batch.shape) == 3:  # (B, S, D_state) - take last frame's state
+                current_state = state_batch[:, -1]  # (B, D_state)
+            elif len(state_batch.shape) == 2:  # (B, D_state) - already single states
+                current_state = state_batch
+            else:
+                raise ValueError(f"Unexpected state_batch shape: {state_batch.shape}")
+        else:
+            current_state = None
+        
+        # Add sequence dimension for VLM processing (single observation)
+        image_1_batch = image_1_batch.unsqueeze(1)  # (B, 1, C, H, W)
+        if image_2_batch is not None:
+            image_2_batch = image_2_batch.unsqueeze(1)  # (B, 1, C, H, W)
+        
+        # Get VLM embeddings
         full_fused_context_seq = self.get_vl_embeddings(
             image_1_batch=image_1_batch,
             raw_prompt_texts_batch=raw_prompt_texts_batch,
@@ -115,45 +151,22 @@ class VLAModel(nn.Module):
 
         B, T_vlm, E = full_fused_context_seq.shape
         
-        # List to store action predictions for each step in the sequence
-        output_actions_for_sequence = []
-
-        for t_step in range(T_vlm):
-            # Extract state for the current step t_step
-            current_step_state = None
-            if state_batch is not None:
-                if t_step < state_batch.shape[1]: # Check if state_batch has this step
-                    current_step_state = state_batch[:, t_step, :]
-                else:
-                    # Handle cases where state_batch might be shorter than T_vlm
-                    # For simplicity, passing None if out of bounds, or could use zeros.
-                    self.logger.debug(f"State_batch sequence length {state_batch.shape[1]} is shorter than T_vlm {T_vlm} at step {t_step}.")
-
-
-            # Extract ground truth actions for the current step t_step (if training)
-            current_step_actions_gt = None
-            if actions_gt_seq is not None:
-                if t_step < actions_gt_seq.shape[1]: # Check if actions_gt_seq has this step
-                    current_step_actions_gt = actions_gt_seq[:, t_step, :]
-                else:
-                    self.logger.debug(f"Actions_gt_seq sequence length {actions_gt_seq.shape[1]} is shorter than T_vlm {T_vlm} at step {t_step}.")
-
-            # Predict action for the current step t_step
-            # The full_fused_context_seq is passed as context for each step's prediction
-            action_pred_for_step = self.predict_action(
-                full_fused_context=full_fused_context_seq,
-                current_step_state=current_step_state,
-                current_step_actions_gt=current_step_actions_gt
+        # Predict the multi-step action sequence using current observation
+        if actions_gt_seq is None:  # Inference
+            action_pred = self.action_head.get_action(
+                fused_tokens=full_fused_context_seq,
+                state=current_state
             )
-            # action_pred_for_step is (B, D_action_output)
-
-            output_actions_for_sequence.append(action_pred_for_step)
-
-        # Stack the list of (B, D_action_output) tensors along a new dimension (dim=1)
-        # to get (B, T_vlm, D_action_output)
-        final_output_seq = torch.stack(output_actions_for_sequence, dim=1)
+        else:  # Training
+            # Pass the full multi-step action sequence to the action head
+            pred_velocity, _noise = self.action_head(
+                fused_tokens=full_fused_context_seq,
+                state=current_state,
+                actions_gt=actions_gt_seq
+            )
+            action_pred = pred_velocity
         
-        return final_output_seq
+        return action_pred
 
     def to(self, *args, **kwargs):
         # Override .to() to ensure submodules are also moved correctly.
@@ -257,4 +270,4 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"Error during VLAModel test: {e}", exc_info=True)
 
-    print("\nVLAModel integration test completed.") 
+    print("\nVLAModel integration test completed.")

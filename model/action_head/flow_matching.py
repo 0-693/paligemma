@@ -315,8 +315,12 @@ class FlowmatchingActionHead(nn.Module):
         # Sample initial noise from simple distribution (e.g., Normal or Uniform in [-1,1])
         action_shape = actions_gt.shape[1]  # total action dim (flattened sequence)
         # Here we assume actions_gt is flattened if sequence. We will reshape if needed:
-
-        actions_gt_seq = actions_gt  # already [B, H, D]
+        
+        # Reshape flattened actions to sequence format [B, horizon, per_action_dim]
+        if self.horizon > 1:
+            actions_gt_seq = actions_gt.view(B, self.horizon, self.per_action_dim)
+        else:
+            actions_gt_seq = actions_gt.unsqueeze(1)  # [B, 1, per_action_dim]
 
             
         # Define initial noise distribution (Beta noise modeling implies using bounded noise).

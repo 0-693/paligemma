@@ -156,6 +156,7 @@ class PaliGemmaVLM(nn.Module):
                 return_tensors="pt",
                 padding="longest",
                 truncation=True,
+                max_length=512,  # Add max_length to prevent truncation warning
             ).to(device)
         except Exception as e:
             self.logger.error(f"Error during self.processor call: {e}")

@@ -52,7 +52,11 @@ class VLADataset(Dataset):
                  siglip_model_name="google/siglip-base-patch16-224",
                  action_dim=7, 
                  state_dim=7,
-                 normalization_stats_path=None): # Added normalization_stats_path
+                 normalization_stats_path=None, # Added normalization_stats_path
+                 # Multi-step action prediction parameters
+                 horizon=1, per_action_dim=7,
+                 # Legacy parameters for old interface compatibility (renamed to avoid conflicts)
+                 tokenizer_name_or_path=None, image_processor_name_or_path=None):
         self.parquet_files = parquet_files if isinstance(parquet_files, list) else [parquet_files]
         self.max_seq_len = max_seq_len
         self.prompt_max_len = prompt_max_len
@@ -63,6 +67,16 @@ class VLADataset(Dataset):
         self.siglip_model_name = siglip_model_name
         self.normalization_stats_path = normalization_stats_path
         self.norm_stats = None
+        
+        # Multi-step action prediction parameters
+        self.horizon = horizon
+        self.per_action_dim = per_action_dim
+        
+        # Validate that action_dim matches horizon * per_action_dim
+        expected_action_dim = horizon * per_action_dim
+        if action_dim != expected_action_dim:
+            self.logger.warning(f"Action dimension mismatch: action_dim={action_dim}, but horizon={horizon} * per_action_dim={per_action_dim} = {expected_action_dim}. Using horizon * per_action_dim.")
+            self.action_dim = expected_action_dim
 
         if self.normalization_stats_path:
             try:
@@ -109,6 +123,10 @@ class VLADataset(Dataset):
         self._load_data()
 
     def _load_data(self):
+        """
+        Load data for multi-step action prediction.
+        For each observation (state, image), collect next horizon actions as target.
+        """
         all_episode_data = []
         for file_path in self.parquet_files:
             try:
@@ -127,7 +145,7 @@ class VLADataset(Dataset):
                     'image_1_bytes': row.get('image_1'), 
                     'image_2_bytes': row.get('image_2'), 
                     'state': np.array(row.get('state', np.zeros(self.state_dim, dtype=np.float32)), dtype=np.float32),
-                    'action': np.array(row.get('action', np.zeros(self.action_dim, dtype=np.float32)), dtype=np.float32),
+                    'action': np.array(row.get('action', np.zeros(self.per_action_dim, dtype=np.float32)), dtype=np.float32),  # Note: single step action
                     'is_first': bool(row.get('is_first', False)),
                     'is_last': bool(row.get('is_last', False)),
                     'is_terminal': bool(row.get('is_terminal', False)),
@@ -138,12 +156,45 @@ class VLADataset(Dataset):
             if current_sequence:
                 all_episode_data.append(current_sequence)
 
+        # Now create training samples with multi-step actions
         for episode in all_episode_data:
-            if len(episode) >= self.max_seq_len:
-                 for i in range(len(episode) - self.max_seq_len + 1):
-                    self.data.append(episode[i : i + self.max_seq_len])
-            elif len(episode) > 0: 
-                 self.data.append(episode) 
+            # For multi-step action prediction, we need at least horizon actions available
+            # We can create samples up to (len(episode) - horizon + 1) positions
+            for i in range(len(episode) - self.horizon + 1):
+                # Current observation (state, images, prompt)
+                current_obs = episode[i]
+                
+                # Collect next horizon actions
+                future_actions = []
+                for j in range(self.horizon):
+                    if i + j < len(episode):
+                        future_actions.append(episode[i + j]['action'])
+                    else:
+                        # If we don't have enough future actions, pad with zeros
+                        future_actions.append(np.zeros(self.per_action_dim, dtype=np.float32))
+                
+                # Concatenate future actions into a single action vector
+                multi_step_action = np.concatenate(future_actions)  # Shape: (horizon * per_action_dim,)
+                
+                # Create training sample
+                training_sample = {
+                    'image_1_bytes': current_obs['image_1_bytes'],
+                    'image_2_bytes': current_obs['image_2_bytes'],
+                    'state': current_obs['state'],
+                    'action': multi_step_action,  # Multi-step action target
+                    'is_first': current_obs['is_first'],
+                    'is_last': current_obs['is_last'],
+                    'is_terminal': current_obs['is_terminal'],
+                    'prompt': current_obs['prompt']
+                }
+                
+                # For consistency with existing code, wrap in a single-element sequence
+                self.data.append([training_sample])
+                
+        self.logger.info(f"Loaded {len(self.data)} training samples with horizon={self.horizon}, per_action_dim={self.per_action_dim}")
+        if len(self.data) > 0:
+            sample_action_shape = self.data[0][0]['action'].shape
+            self.logger.info(f"Sample action shape: {sample_action_shape} (expected: ({self.action_dim},))") 
 
     def __len__(self):
         return len(self.data)
@@ -181,157 +232,136 @@ class VLADataset(Dataset):
 
     def __getitem__(self, idx):
         sequence_data_raw = self.data[idx]
-        current_actual_seq_len = len(sequence_data_raw)
-
-        # 1. 主摄像头图片处理
-        processed_pixel_values_1_list = []
-        processed_pixel_values_2_list = []
-        for step in sequence_data_raw:
-            img1_bytes = step.get('image_1_bytes')
-            img2_bytes = step.get('image_2_bytes')
-            # image_1
-            if img1_bytes:
-                try:
-                    pil_img1 = Image.open(io.BytesIO(img1_bytes)).convert("RGB")
-                    tensor_img1 = self.siglip_image_processor(images=pil_img1, return_tensors="pt").pixel_values.squeeze(0)
-                except Exception as e:
-                    self.logger.warning(f"Corrupted image_1 bytes at idx {idx}. Error: {e}")
-                    tensor_img1 = torch.zeros((self.default_img_C, self.default_img_H, self.default_img_W), dtype=torch.float32)
-            else:
-                tensor_img1 = torch.zeros((self.default_img_C, self.default_img_H, self.default_img_W), dtype=torch.float32)
-            processed_pixel_values_1_list.append(tensor_img1)
-            # image_2
-            if img2_bytes:
-                try:
-                    pil_img2 = Image.open(io.BytesIO(img2_bytes)).convert("RGB")
-                    tensor_img2 = self.siglip_image_processor(images=pil_img2, return_tensors="pt").pixel_values.squeeze(0)
-                except Exception as e:
-                    self.logger.warning(f"Corrupted image_2 bytes at idx {idx}. Error: {e}")
-                    tensor_img2 = torch.zeros((self.default_img_C, self.default_img_H, self.default_img_W), dtype=torch.float32)
-            else:
-                tensor_img2 = torch.zeros((self.default_img_C, self.default_img_H, self.default_img_W), dtype=torch.float32)
-            processed_pixel_values_2_list.append(tensor_img2)
-
-        images_1_padded = self._pad_modalities(processed_pixel_values_1_list, self.max_seq_len, (self.default_img_C, self.default_img_H, self.default_img_W), torch.float32)
-        images_2_padded = self._pad_modalities(processed_pixel_values_2_list, self.max_seq_len, (self.default_img_C, self.default_img_H, self.default_img_W), torch.float32)
-
-        # 2. Raw Prompt Text (consistent for the sequence)
-        raw_prompt_text = sequence_data_raw[0]['prompt'] if sequence_data_raw else ""
-
-        # 3. States and Actions
-        states_list = [torch.tensor(step['state'], dtype=torch.float32) for step in sequence_data_raw]
-        actions_list = [torch.tensor(step['action'], dtype=torch.float32) for step in sequence_data_raw]
+        # Since we modified _load_data to store single samples wrapped in a list
+        # we have a single training sample here
+        if len(sequence_data_raw) != 1:
+            self.logger.warning(f"Expected single sample, got {len(sequence_data_raw)} samples at idx {idx}")
         
-        states_padded_orig = self._pad_modalities(states_list, self.max_seq_len, self.state_dim, torch.float32)
-        actions_padded_orig = self._pad_modalities(actions_list, self.max_seq_len, self.action_dim, torch.float32)
+        # Extract the single training sample
+        sample = sequence_data_raw[0]
+        
+        # 1. Process single images (not sequences)
+        # Process image_1
+        img1_bytes = sample.get('image_1_bytes')
+        if img1_bytes:
+            try:
+                pil_img1 = Image.open(io.BytesIO(img1_bytes)).convert("RGB")
+                image_1 = self.siglip_image_processor(images=pil_img1, return_tensors="pt").pixel_values.squeeze(0)
+            except Exception as e:
+                self.logger.warning(f"Corrupted image_1 bytes at idx {idx}. Error: {e}")
+                image_1 = torch.zeros((self.default_img_C, self.default_img_H, self.default_img_W), dtype=torch.float32)
+        else:
+            image_1 = torch.zeros((self.default_img_C, self.default_img_H, self.default_img_W), dtype=torch.float32)
+        
+        # Process image_2
+        img2_bytes = sample.get('image_2_bytes')
+        if img2_bytes:
+            try:
+                pil_img2 = Image.open(io.BytesIO(img2_bytes)).convert("RGB")
+                image_2 = self.siglip_image_processor(images=pil_img2, return_tensors="pt").pixel_values.squeeze(0)
+            except Exception as e:
+                self.logger.warning(f"Corrupted image_2 bytes at idx {idx}. Error: {e}")
+                image_2 = torch.zeros((self.default_img_C, self.default_img_H, self.default_img_W), dtype=torch.float32)
+        else:
+            image_2 = torch.zeros((self.default_img_C, self.default_img_H, self.default_img_W), dtype=torch.float32)
 
-        states_padded_normalized = states_padded_orig
-        actions_padded_normalized = actions_padded_orig
+        # 2. Raw Prompt Text
+        raw_prompt_text = sample['prompt']
+
+        # 3. Single State (not sequence)
+        state = torch.tensor(sample['state'], dtype=torch.float32)
+
+        # 4. Multi-step Action
+        action = torch.tensor(sample['action'], dtype=torch.float32)  # Shape: (horizon * per_action_dim,)
 
         # Apply normalization if stats are available
+        state_normalized = state
+        action_normalized = action
+
         if self.norm_stats:
             if 'state' in self.norm_stats and self.norm_stats['state']['min'] is not None and self.norm_stats['state']['max'] is not None:
-                # Create a mask for valid (non-padded) steps before normalization
-                valid_steps_mask = torch.zeros(self.max_seq_len, dtype=torch.bool)
-                valid_steps_mask[:current_actual_seq_len] = True
-                
-                # Only normalize valid steps; padded steps remain zero (or their original padding value)
-                # which should be fine as (0 - min) / (max - min) - 1 will not be in [-1, 1] unless 0 is within original range.
-                # It's often better to normalize, then pad. But here data is padded first.
-                # So, we select valid steps, normalize, and then place them back or rely on broadcasting.
-                
-                # Normalize valid part of states_padded_orig
-                valid_states_to_norm = states_padded_orig[valid_steps_mask]
-                if valid_states_to_norm.numel() > 0: # Check if there are any valid states
-                    normalized_valid_states = normalize(valid_states_to_norm, 
-                                                        self.norm_stats['state']['min'], 
-                                                        self.norm_stats['state']['max'])
-                    # Create a new tensor for normalized states and fill it
-                    states_padded_normalized = torch.zeros_like(states_padded_orig)
-                    states_padded_normalized[valid_steps_mask] = normalized_valid_states
-                else: # If no valid states, keep as original (should be all zeros if padding was zero)
-                    states_padded_normalized = states_padded_orig
-
+                state_normalized = normalize(state, 
+                                           self.norm_stats['state']['min'], 
+                                           self.norm_stats['state']['max'])
 
             if 'action' in self.norm_stats and self.norm_stats['action']['min'] is not None and self.norm_stats['action']['max'] is not None:
-                valid_steps_mask = torch.zeros(self.max_seq_len, dtype=torch.bool) # Re-create for actions
-                valid_steps_mask[:current_actual_seq_len] = True
-
-                valid_actions_to_norm = actions_padded_orig[valid_steps_mask]
-                if valid_actions_to_norm.numel() > 0:
-                    normalized_valid_actions = normalize(actions_padded_orig[valid_steps_mask], 
+                # For multi-step actions, normalize each step separately
+                if self.horizon > 1 and action.shape[-1] == self.action_dim:
+                    # Reshape multi-step actions: (horizon * per_action_dim,) -> (horizon, per_action_dim)
+                    action_reshaped = action.reshape(self.horizon, self.per_action_dim)
+                    normalized_actions_list = []
+                    
+                    for step_idx in range(self.horizon):
+                        step_action = action_reshaped[step_idx]  # (per_action_dim,)
+                        normalized_step_action = normalize(step_action, 
                                                          self.norm_stats['action']['min'], 
                                                          self.norm_stats['action']['max'])
-                    actions_padded_normalized = torch.zeros_like(actions_padded_orig)
-                    actions_padded_normalized[valid_steps_mask] = normalized_valid_actions
+                        normalized_actions_list.append(normalized_step_action)
+                    
+                    # Concatenate back to multi-step format: (horizon, per_action_dim) -> (horizon * per_action_dim,)
+                    action_normalized = torch.cat(normalized_actions_list, dim=0)
                 else:
-                    actions_padded_normalized = actions_padded_orig
+                    # Single-step actions or horizon=1, normalize directly
+                    action_normalized = normalize(action, 
+                                                self.norm_stats['action']['min'], 
+                                                self.norm_stats['action']['max'])
 
+        # 5. For compatibility with VLM processing, create minimal attention mask
+        # Since we have single observation, attention mask is just [True]
+        vlm_attention_mask = torch.tensor([True], dtype=torch.bool)
 
-        # 4. VLM attention mask for valid (non-padded) sequence steps
-        vlm_attention_mask = torch.zeros(self.max_seq_len, dtype=torch.bool)
-        vlm_attention_mask[:current_actual_seq_len] = True
-        # 5. Meta flags (padded)
-        is_first_flags = [step['is_first'] for step in sequence_data_raw] + [False] * (self.max_seq_len - current_actual_seq_len)
-        is_last_flags = [step['is_last'] for step in sequence_data_raw] + [False] * (self.max_seq_len - current_actual_seq_len)
-        is_terminal_flags = [step['is_terminal'] for step in sequence_data_raw] + [False] * (self.max_seq_len - current_actual_seq_len)
-        is_first_tensor = torch.tensor(is_first_flags[:self.max_seq_len], dtype=torch.bool)
-        is_last_tensor = torch.tensor(is_last_flags[:self.max_seq_len], dtype=torch.bool)
-        is_terminal_tensor = torch.tensor(is_terminal_flags[:self.max_seq_len], dtype=torch.bool)
-        # 6. Tokenized "pure" prompt (for other potential uses, not for PaliGemmaVLM directly if it uses processor)
+        # 6. Meta flags for the single sample
+        is_first = torch.tensor([sample['is_first']], dtype=torch.bool)
+        is_last = torch.tensor([sample['is_last']], dtype=torch.bool)
+        is_terminal = torch.tensor([sample['is_terminal']], dtype=torch.bool)
+
+        # 7. Tokenized prompt for compatibility
         tokenized_pure_text_prompt = self.tokenizer(
-            text=raw_prompt_text,
-            return_tensors="pt",
-            padding="max_length", 
-            truncation=True, 
-            max_length=self.prompt_max_len 
+            raw_prompt_text,
+            add_special_tokens=True,
+            truncation=True,
+            padding="max_length",
+            max_length=self.prompt_max_len,
+            return_tensors="pt"
         )
-        # print(f"======state:{states_padded}\n")
-        # print(f"======action:{actions_padded}\n")
-
-        # Log for debugging normalization
-        if self.norm_stats and current_actual_seq_len > 0: # Log only if stats loaded and sequence is not empty
-            # Log first valid original action (before padding and normalization)
-            original_action_first_step = actions_list[0]
-            # Log first valid normalized action (after normalization and padding)
-            normalized_action_first_step = actions_padded_normalized[0]
-            
-            self.logger.debug(f"Dataset ID: {idx} | Actual Seq Len: {current_actual_seq_len}")
-            self.logger.debug(f"  Action Original (first valid): {original_action_first_step.tolist()}")
-            self.logger.debug(f"  Action Normalized (first valid): {normalized_action_first_step.tolist()}")
-            if torch.allclose(original_action_first_step, normalized_action_first_step) and torch.norm(original_action_first_step) > 10: # Heuristic: if they are same and norm is large, norm likely failed
-                self.logger.warning(f"Dataset ID: {idx} - Normalized action seems same as original and has large norm. Normalization might not have been applied as expected.")
-                self.logger.warning(f"    Action Min Stats: {self.norm_stats['action']['min'].tolist()}")
-                self.logger.warning(f"    Action Max Stats: {self.norm_stats['action']['max'].tolist()}")
 
         return {
-            "raw_prompt_text": raw_prompt_text,         # Raw text string
-            "image_1": images_1_padded,                 # (max_seq_len, C, H, W)
-            "image_2": images_2_padded,                 # (max_seq_len, C, H, W)
-            "state": states_padded_normalized,           # Use normalized state
-            "action": actions_padded_normalized,         # Use normalized action as GT for training
-            "input_ids_pure_text": tokenized_pure_text_prompt["input_ids"].squeeze(0), # (prompt_max_len)
-            "attention_mask_pure_text": tokenized_pure_text_prompt["attention_mask"].squeeze(0).bool(), # (prompt_max_len)
-            "vlm_attention_mask": vlm_attention_mask,   # (max_seq_len)
-            "is_first_frame": is_first_tensor,          # (max_seq_len)
-            "is_last_frame": is_last_tensor,            # (max_seq_len)
-            "is_terminal_frame": is_terminal_tensor,    # (max_seq_len)
-            "sequence_length": current_actual_seq_len   # Scalar
+            'image_1': image_1,  # (C, H, W)
+            'image_2': image_2,  # (C, H, W) 
+            'state': state_normalized,  # (state_dim,)
+            'action': action_normalized,  # (action_dim,) = (horizon * per_action_dim,)
+            'raw_prompt_text': raw_prompt_text,
+            'vlm_attention_mask': vlm_attention_mask,  # (1,)
+            'is_first': is_first,  # (1,)
+            'is_last': is_last,  # (1,)
+            'is_terminal': is_terminal,  # (1,)
+            'input_ids_pure_text': tokenized_pure_text_prompt['input_ids'].squeeze(0),  # (prompt_max_len,)
+            'attention_mask_pure_text': tokenized_pure_text_prompt['attention_mask'].squeeze(0),  # (prompt_max_len,)
+            'sequence_length': torch.tensor(1, dtype=torch.long)  # Always 1 for single observation
         }
 
+
 def vla_collate_fn(batch):
+    """
+    Collate function for single observation → multi-step action data.
+    Each sample now contains single observations with multi-step action targets.
+    """
     collated = {}
     elem = batch[0]
 
     for key in elem:
         if key == "raw_prompt_text":
-            collated[key] = [d[key] for d in batch] # List of B strings
+            # List of B strings
+            collated[key] = [d[key] for d in batch]
         elif isinstance(elem[key], torch.Tensor):
+            # Stack all tensor fields: images (C,H,W), states (state_dim,), actions (action_dim,), etc.
             collated[key] = torch.stack([d[key] for d in batch])
-        elif isinstance(elem[key], (int, float, bool)): # Handle scalar metadata like sequence_length
-             collated[key] = torch.tensor([d[key] for d in batch])
-        # else: # Potentially other types of data
-        #    collated[key] = [d[key] for d in batch]
+        elif isinstance(elem[key], (int, float, bool)):
+            # Handle scalar metadata like sequence_length
+            collated[key] = torch.tensor([d[key] for d in batch])
+        else:
+            # Other types, keep as list
+            collated[key] = [d[key] for d in batch]
 
     # Ensure sequence_length is a tensor if not already handled
     if "sequence_length" in elem and not isinstance(collated.get("sequence_length"), torch.Tensor):
